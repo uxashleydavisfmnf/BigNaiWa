@@ -1,7 +1,1 @@
-{
-  "v": 1,
-  "updatedAt": 1791390452995,
-  "total": 0,
-  "topN": 100,
-  "entries": []
-}
+{"v":1,"updatedAt":1791391225318,"total":1,"topN":100,"entries":[{"id":"","owner":"data/owners/.json","name":"测试玩家","score":210,"submittedAt":1791391222249,"runId":"muyc2wt1-3","run":null,"flags":0}]}
