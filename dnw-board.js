@@ -80,8 +80,10 @@
       if (!e || typeof e !== 'object') continue;          // 缺位 → 跳过，不炸
       var score = Number(e.score);
       if (!isFinite(score) || score < 0) continue;
-      var id = String(e.id == null ? '' : e.id);
-      if (!id || seen[id]) continue;                       // 同一个玩家只留一条
+      var id = String(e.id == null ? '' : e.id).trim();
+      /* 空 id 是脏数据（早期版本在拿不到玩家标识时写进去的），直接忽略 */
+      if (!id || id === 'null' || id === 'undefined') continue;
+      if (seen[id]) continue;                       // 同一个玩家只留一条
       seen[id] = 1;
       b.entries.push({
         id: id,

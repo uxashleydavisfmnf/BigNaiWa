@@ -45,6 +45,7 @@
   const API = 'https://' + Cred.endpoint + '/repos/' + REPO_OWNER + '/' + REPO_NAME + '/contents/';
   const NAME_KEY = 'danaiwa.nick.v2';
   const LOCAL_ID_KEY = 'danaiwa.localid.v1';
+  const IP_CACHE_KEY = 'danaiwa.ip.v1';
   const LAST_SUBMIT_KEY = 'danaiwa.lastsubmit.v2';
   const MIN_SUBMIT_GAP = 10000;      // 两次提交至少隔 10 秒，别把仓库当靶子打
 
@@ -155,22 +156,53 @@
     return v;
   }
 
-  function resolveIdentity() {
-    if (myId) return Promise.resolve(myId);
+  /* 公网 IP：多试几个源，带超时，拿到就缓存。
+     拿不到也没关系 —— 退化成浏览器本地随机 ID，照样能玩、能上榜，
+     只是换个网络/换个浏览器就变成「另一个人」。 */
+  const IP_SOURCES = [
+    { url: 'https://ipapi.co/json/', key: 'ip' },
+    { url: 'https://icanhazip.com/', plain: true },
+    { url: 'https://api.ipify.org?format=json', key: 'ip' }
+  ];
+
+  function fetchIP() {
+    const cached = sessionStorage.getItem(IP_CACHE_KEY);
+    if (cached) return Promise.resolve(cached);
+
+    let i = 0;
+    const tryNext = () => {
+      if (i >= IP_SOURCES.length) return Promise.resolve('');
+      const src = IP_SOURCES[i++];
+      const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = setTimeout(() => { if (ctl) ctl.abort(); }, 4500);
+      return fetch(src.url, { cache: 'no-store', signal: ctl ? ctl.signal : undefined })
+        .then((r) => (r.ok ? (src.plain ? r.text() : r.json()) : null))
+        .then((d) => {
+          clearTimeout(timer);
+          const ip = d && (src.plain ? String(d).trim() : String(d[src.key] || ''));
+          if (ip && /^[0-9a-fA-F:.]{3,45}$/.test(ip)) {
+            try { sessionStorage.setItem(IP_CACHE_KEY, ip); } catch (e) { /* 忽略 */ }
+            return ip;
+          }
+          return tryNext();
+        })
+        .catch(() => { clearTimeout(timer); return tryNext(); });
+    };
+    return tryNext();
+  }
+
+  function resolveIdentity(force) {
+    if (myId && !force) return Promise.resolve(myId);
     const salt = P_VOIDED;          // 盐只用来区分用途，不参与保密
-    return fetch('https://api.ipify.org?format=json', { cache: 'no-store' })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((j) => {
-        const ip = j && j.ip ? String(j.ip) : '';
-        myId = Board.hashIdentity(ip || ('local:' + localId()), salt);
-        myKey = ip ? 'ip' : 'local';
-        return myId;
-      })
-      .catch(() => {
-        myId = Board.hashIdentity('local:' + localId(), salt);
-        myKey = 'local';
-        return myId;
-      });
+    return fetchIP().then((ip) => {
+      myId = Board.hashIdentity(ip || ('local:' + localId()), salt);
+      myKey = ip ? 'ip' : 'local';
+      return myId;
+    }).catch(() => {
+      myId = Board.hashIdentity('local:' + localId(), salt);
+      myKey = 'local';
+      return myId;
+    });
   }
 
   /* ---------------------------------------------------------
@@ -338,32 +370,43 @@
     const at = Date.now();
     pendingRun = { score: score, runId: runId, run: run, name: myName(), at: at };
 
-    /* —— 本机乐观上榜：名次当场就算出来 —— */
-    const provisional = {
-      id: myId || ('local-' + localId()),
-      owner: ownerPath(myId || ''),
-      name: myName(),
-      score: score,
-      submittedAt: at,
-      runId: runId,
-      run: null
-    };
-    const applied = Board.applyEntry(board, provisional);
-    myEntry = {
-      id: provisional.id,
-      name: provisional.name,
-      score: provisional.score,
-      submittedAt: provisional.submittedAt,
-      rank: applied.rank
-    };
-    const madeLocal = applied.rank <= Board.TOP_N;
-
-    setMsg(madeLocal
-      ? ('本局 ' + Board.formatScore(score) + ' 分，暂列第 ' + applied.rank + ' 名')
-      : ('本局 ' + Board.formatScore(score) + ' 分，没进前 100'), madeLocal ? 'good' : '');
+    setMsg('本局 ' + Board.formatScore(score) + ' 分，正在核验…', '');
     setSync('syncing', '正在同步…');
-    render();
-    submit(madeLocal);
+
+    /* 先确认「我是谁」（一个人只留最好成绩就靠这个 ID），再决定上不上榜 */
+    resolveIdentity().then((id) => {
+      if (!id) {
+        /* 认不出身份就别乱写：写成空 ID 会在库里留一条脏记录 */
+        setSync('failed', '拿不到玩家标识，暂时无法上榜');
+        showRetry(true);
+        return;
+      }
+
+      const provisional = {
+        id: id,
+        owner: ownerPath(id),
+        name: pendingRun.name,
+        score: score,
+        submittedAt: at,
+        runId: runId,
+        run: null
+      };
+      const applied = Board.applyEntry(board, provisional);
+      myEntry = {
+        id: id,
+        name: provisional.name,
+        score: score,
+        submittedAt: at,
+        rank: applied.rank
+      };
+      const madeLocal = applied.rank <= Board.TOP_N;
+
+      setMsg(madeLocal
+        ? ('本局 ' + Board.formatScore(score) + ' 分，暂列第 ' + applied.rank + ' 名')
+        : ('本局 ' + Board.formatScore(score) + ' 分，没进前 100'), madeLocal ? 'good' : '');
+      render();
+      submit(madeLocal);
+    });
   }
 
   function submit(madeLocal) {
@@ -583,7 +626,18 @@
 
   function retry() {
     if (!pendingRun) return;
-    submit(myEntry && myEntry.rank <= Board.TOP_N);
+    showRetry(false);
+    setSync('syncing', '正在同步…');
+    /* 重试时连身份一起重来：上一次很可能就是卡在拿不到玩家标识 */
+    resolveIdentity(true).then((id) => {
+      if (!id) {
+        setSync('failed', '拿不到玩家标识，暂时无法上榜');
+        showRetry(true);
+        return;
+      }
+      if (!myEntry) myEntry = { id: id, rank: Board.rankOf(board, id, pendingRun.score, pendingRun.at) };
+      submit(myEntry.rank <= Board.TOP_N);
+    });
   }
 
   function bind() {
