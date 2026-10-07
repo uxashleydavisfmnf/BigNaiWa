@@ -368,9 +368,13 @@
 
   function submit(madeLocal) {
     if (submitting || !pendingRun) return;
-    if (Date.now() - lastSubmitAt < MIN_SUBMIT_GAP) {
-      setSync('failed', '刚提交过，稍等一下再试');
-      showRetry(true);
+    const since = Date.now() - lastSubmitAt;
+    if (since < MIN_SUBMIT_GAP) {
+      /* 连着打两局时别硬撞：等一下自己再传，不用玩家点重试 */
+      const wait = MIN_SUBMIT_GAP - since;
+      setSync('syncing', '正在同步…');
+      showRetry(false);
+      setTimeout(() => { submit(madeLocal); }, wait + 300);
       return;
     }
     submitting = true;
