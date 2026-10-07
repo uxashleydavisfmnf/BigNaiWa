@@ -169,4 +169,33 @@ eq(vLong.verdict, 'pass', '一整局复算 = pass', longRun.state.score + ' 分 
 ok(ms < 20000, '复算耗时可以接受', ms + ' ms（存档 ' + (JSON.stringify(longPacked).length / 1024).toFixed(1) + ' KB）');
 
 console.log('\n' + pass + ' 通过 / ' + fail + ' 失败');
-process.exit(fail ? 1 : 0);
+
+/* ---------- H. 分段复算（举报用）和同步复算结果必须一致 ---------- */
+(async () => {
+  console.log('\n[H] 分段复算（让出主线程版）结果与同步版一致');
+  const packed2 = longPacked;
+  const sync = Core.validateRun(Core.decodeRun(packed2));
+
+  let ticks = 0;
+  const t1 = Date.now();
+  const asyncVerdict = await Core.verifyRunAsync(Core.decodeRun(packed2), {
+    timeSlice: 5,
+    onProgress: () => { ticks++; }
+  });
+  const msAsync = Date.now() - t1;
+
+  eq(asyncVerdict.verdict, sync.verdict, '裁决一致');
+  eq(asyncVerdict.replayScore, sync.replayScore, '复算分数一致');
+  eq(asyncVerdict.frameErrorCount, sync.frameErrorCount, '快照错位数一致');
+  ok(ticks > 0, '确实分段让出了主线程', ticks + ' 次');
+
+  /* 改过分数的那份，两条路径也必须给出同一个结论 */
+  const cheat2 = Object.assign({}, packed2, { score: packed2.score + 8000 });
+  const s2 = Core.validateRun(Core.decodeRun(cheat2));
+  const a2 = await Core.verifyRunAsync(Core.decodeRun(cheat2), { timeSlice: 5 });
+  eq(a2.verdict, s2.verdict, '作弊样本：两条路径结论一致（' + a2.verdict + '）');
+
+  console.log('  分段复算耗时 ' + msAsync + ' ms（同步版 ' + ms + ' ms）');
+  console.log('\n' + pass + ' 通过 / ' + fail + ' 失败');
+  process.exit(fail ? 1 : 0);
+})();

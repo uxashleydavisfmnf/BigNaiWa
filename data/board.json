@@ -1,18 +1,7 @@
 {
   "v": 1,
-  "updatedAt": 1791391583347,
-  "total": 1,
+  "updatedAt": 1791392305675,
+  "total": 0,
   "topN": 100,
-  "entries": [
-    {
-      "id": "0c680j0ieflrs",
-      "owner": "data/owners/0c680j0ieflrs.json",
-      "name": "奶娃测试员",
-      "score": 234,
-      "submittedAt": 1791391512473,
-      "runId": "muyc8xc3-5",
-      "run": null,
-      "flags": 0
-    }
-  ]
+  "entries": []
 }

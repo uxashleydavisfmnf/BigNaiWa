@@ -827,18 +827,19 @@
     return a;
   }
 
-  /* 复算一局。
-     opts.snapTolerance 允许的末位浮点差（分数必须严格相等，这里只管位置指纹）
-     返回：
-       ok          复算分数与申报分数是否一致
-       replayScore 复算出来的分数
-       claimed     申报分数
-       delta       复算 - 申报
-       frameErrors 快照对不上的地方（前几条，供举报展示）
-       verdict     'pass' | 'fraud' | 'tamper' | 'malformed'  */
-  function verifyRun(rec, opts) {
+  /* 分段复算（可暂停版）。
+     举报是在玩家浏览器里当场跑的：一整局要算几百万次浮点运算，
+     一口气跑会卡住页面（连「复算中…」都刷不出来）。
+     这里把复算写成一个生成器：每算一段就 yield 一次把主线程交还出去，
+     下次 next() 从原处接着算 —— 状态不重来，所以总耗时和同步版几乎一样。
+
+     用法：
+       var it = verifySteps(rec, opts);          // 或 Core.verifyRunAsync(...)
+       var r = it.next(); while (!r.done) r = it.next(); */
+  function* verifySteps(rec, opts) {
     opts = opts || {};
     var scoreTol = opts.scoreTolerance === undefined ? 0 : opts.scoreTolerance;
+    var every = opts.yieldEvery || 90;          // 每多少帧交还一次主线程
 
     if (!rec || rec.seed === undefined || rec.seed === null) {
       return { ok: false, verdict: 'malformed', reason: '缺少随机种子', replayScore: 0, claimed: 0, delta: 0, frameErrors: [] };
@@ -858,7 +859,7 @@
     var frameErrors = [];
     for (var i = 0; i < actions.length; i++) {
       var a = actions[i];
-      if (a.t < 0 || a.t > 6 * 60 * 60 * 60) {
+      if (a.t < 0 || a.t > MAX_FRAMES) {
         return { ok: false, verdict: 'malformed', reason: '动作时间越界', replayScore: 0, claimed: claimed, delta: 0, frameErrors: [] };
       }
       if (a.k === 'drop') {
@@ -880,8 +881,9 @@
     var si = 0;
     var ai = 0;
     var guard = 0;
+    var sinceYield = 0;
 
-    /* 复算循环：每帧先对齐快照，再执行这一帧的动作 */
+    /* 复算主循环：每帧先对齐快照，再执行这一帧的动作 */
     while (guard++ < maxFrame + 600) {
       var f = g.getFrame();
 
@@ -910,6 +912,11 @@
 
       if (si >= snaps.length && ai >= actions.length) break;
       g.update(FIXED);
+
+      if (++sinceYield >= every) {
+        sinceYield = 0;
+        yield f;                                  // 交还主线程，下次从这里接着算
+      }
     }
 
     /* 动作放完之后再空跑两秒，让盘面落定，避免「最后一颗还在空中」导致误判 */
@@ -940,6 +947,41 @@
       frameErrors: frameErrors.slice(0, 8),
       frameErrorCount: frameErrors.length
     };
+  }
+
+  /* 复算一局（同步版；内部就是上面那个生成器一口气跑完，用于 Node 与 GitHub Action） */
+  function verifyRun(rec, opts) {
+    var it = verifySteps(rec, opts || {});
+    var r = it.next();
+    while (!r.done) r = it.next();
+    return r.value;
+  }
+
+  /* 异步版：每算一段就让出主线程，界面照样能刷进度
+     可选 opts.onProgress(frame)/opts.timeSlice/opts.yieldEvery */
+  function verifyRunAsync(rec, opts) {
+    opts = opts || {};
+    return new Promise(function (resolve, reject) {
+      var slice = opts.timeSlice || 12;
+      var it;
+      try {
+        it = verifySteps(rec, opts);
+      } catch (e) { reject(e); return; }
+
+      (function step() {
+        var deadline = Date.now() + slice;
+        try {
+          for (;;) {
+            var r = it.next();
+            if (r.done) { resolve(r.value); return; }
+            if (opts.onProgress) {
+              try { opts.onProgress(r.value); } catch (e) { /* 进度回调出错不影响复算 */ }
+            }
+            if (Date.now() >= deadline) { setTimeout(step, 0); return; }
+          }
+        } catch (e) { reject(e); }
+      })();
+    });
   }
 
   /* ---------------------------------------------------------
@@ -1068,6 +1110,7 @@
   return {
     createGame: createGame,
     verifyRun: verifyRun,
+    verifyRunAsync: verifyRunAsync,
     inspectRun: inspectRun,
     validateRun: validateRun,
     setShapes: setShapes,

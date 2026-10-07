@@ -531,14 +531,16 @@
     const old = btn.textContent;
     btn.disabled = true;
 
-    let step = 0;
-    const dots = setInterval(() => {
-      step = (step + 1) % 3;
-      btn.textContent = '复算中' + '.'.repeat(step + 1);
-    }, 400);
+    /* 复算是分段跑的（每 12ms 交还一次主线程），所以这里能实时刷进度 */
+    let lastPct = -1;
+    const paint = (pct) => {
+      if (pct === lastPct) return;
+      lastPct = pct;
+      btn.textContent = pct > 0 ? ('复算中 ' + pct + '%') : '复算中…';
+    };
+    paint(0);
 
     const stop = (text) => {
-      clearInterval(dots);
       btn.disabled = false;
       btn.textContent = text || old;
     };
@@ -553,44 +555,54 @@
       const claimed = Number(res.data.score) || Number(entry.score) || 0;
       rec.score = claimed;
 
-      const verdict = Core.validateRun(rec);
+      let total = 0;
+      const acts = rec.actions || [];
+      const snaps = rec.snapshots || [];
+      if (acts.length) total = Math.max(total, acts[acts.length - 1].t);
+      if (snaps.length) total = Math.max(total, snaps[snaps.length - 1].f);
 
-      if (verdict.verdict === 'pass') {
-        stop('已核对');
-        btn.title = '本地复算结果与榜上分数一致（' + verdict.replayScore + ' 分），没有发现问题';
-        return;
-      }
+      return Core.verifyRunAsync(rec, {
+        timeSlice: 12,
+        onProgress: (frameNow) => {
+          if (total > 0) paint(Math.min(99, Math.round(frameNow / total * 100)));
+        }
+      }).then((verdict) => {
+        if (verdict.verdict === 'pass') {
+          stop('已核对');
+          btn.title = '本地复算结果与榜上分数一致（' + verdict.replayScore + ' 分），没有发现问题';
+          return false;
+        }
 
-      /* 对不上：把举报连同证据写进库里 */
-      const evidence = {
-        v: 1,
-        at: Date.now(),
-        targetId: entry.id,
-        targetName: entry.name,
-        claimed: claimed,
-        replay: verdict.replayScore,
-        delta: verdict.delta,
-        verdict: verdict.verdict,
-        reason: verdict.reason || '',
-        frameErrors: verdict.frameErrorCount || 0,
-        by: myId || ('local-' + localId()),
-        runId: entry.runId || ''
-      };
-      const name = String(entry.id).slice(0, 6) + '-' + Date.now().toString(36);
-      return writeJson(reportPath(name), evidence, null,
-        '举报：' + entry.name + ' ' + claimed + ' 分（复算 ' + verdict.replayScore + '）'
-      ).then(() => {
-        stop('已举报 ✓');
-        btn.title = '已提交举报：本地复算 ' + verdict.replayScore + ' 分，榜上写的 ' + claimed + ' 分';
-        if (listEl) {
+        /* 对不上：把举报连同证据写进库里（不直接改别人的成绩，
+           抹除交给自动化复核按证据执行，免得谁都能一键删榜） */
+        const evidence = {
+          v: 1,
+          at: Date.now(),
+          targetId: entry.id,
+          targetName: entry.name,
+          claimed: claimed,
+          replay: verdict.replayScore,
+          delta: verdict.delta,
+          verdict: verdict.verdict,
+          reason: verdict.reason || '',
+          frameErrors: verdict.frameErrorCount || 0,
+          by: myId || ('local-' + localId()),
+          runId: entry.runId || ''
+        };
+        const name = String(entry.id).slice(0, 6) + '-' + Date.now().toString(36);
+        return writeJson(reportPath(name), evidence, null,
+          '举报：' + entry.name + ' ' + claimed + ' 分（复算 ' + verdict.replayScore + '）'
+        ).then(() => {
+          stop('已举报 ✓');
+          btn.title = '已提交举报：本地复算 ' + verdict.replayScore + ' 分，榜上写的 ' + claimed + ' 分';
           const row = btn.parentNode;
           if (row && row.classList) row.classList.add('is-reported');
-        }
-        return true;
+          return true;
+        });
       });
     }).catch((err) => {
       stop('举报失败');
-      btn.title = '举报失败：' + err.message;
+      btn.title = '举报失败：' + (err && err.message ? err.message : err);
     });
   }
 
