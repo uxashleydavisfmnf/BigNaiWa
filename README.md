@@ -1,4 +1,4 @@
-﻿# 合成大奶娃
+# 合成大奶娃
 
 > ### 🙏 原作者与出处
 >
@@ -123,6 +123,8 @@ python -m http.server 8080
 | `gameplay.test.js` | 复活 / 清场玩法自检（`node gameplay.test.js`） |
 | `determinism.test.js` | 确定性 + 防作弊自检（`node determinism.test.js`） |
 | `board.test.js` | 排行榜账本自检（`node board.test.js`） |
+| `moderate.test.js` | 举报复核端到端自检（`node moderate.test.js`） |
+| `integration.test.js` | 前端集成自检：真实页面脚本 + 假 GitHub 跑完整流程（`node integration.test.js`） |
 | `preview.png` | 预览图 |
 
 > 打赏入口：原版是 `sponsor.js` 弹窗 + 微信收款码；本改进版按原作者优先的原则，
@@ -423,6 +425,8 @@ node physics.test.js          # 物理手感（回弹 / 堆叠稳定 / 不穿墙
 node gameplay.test.js         # 玩法（复活币、神奶蛙清场、结算）
 node determinism.test.js      # 确定性 + 防作弊（改分数/改快照/改动作 全都要被抓出来）
 node board.test.js            # 排行榜账本（前 100 / 每人只留最好 / 顶掉最低 / 抗缺位）
+node moderate.test.js         # 举报复核端到端（确认造假→删数据；无故举报→驳回）
+node integration.test.js      # 前端集成（真实 game.js + leaderboard.js + 假 GitHub 跑全流程）
 node tools/rebuild-board.js   # 本地重建总榜 + 复核举报
 ```
 
