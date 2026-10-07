@@ -1,0 +1,44 @@
+# 把仓库根目录发布成 GitHub Pages 站点。
+#
+# 为什么不用「Deploy from a branch」：那条老路子走的是 Jekyll 构建管线，
+# 在纯静态仓库上反而容易卡在 "Page build failed"（而且不给原因）。
+# 用 Actions 直接上传静态产物最稳，构建结果也能在 Actions 页面看到。
+#
+# 这是纯静态站点：不需要装依赖、不需要构建步骤，整个仓库原样发布。
+
+name: 发布 Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 配置 Pages
+        uses: actions/configure-pages@v5
+
+      - name: 打包站点
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+
+      - name: 发布
+        id: deployment
+        uses: actions/deploy-pages@v4
