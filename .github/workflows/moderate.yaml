@@ -1,0 +1,57 @@
+# 举报复核（自动执行）
+#
+# 排行榜前端会在玩家浏览器里用「随机种子 + 动作序列」把被举报的那一局完整复算一遍，
+# 只有复算结果和榜上分数对不上时，才会在 data/reports/ 下写一份举报记录
+# （记录里带着复算分数、差值、对不上的快照帧）。这个工作流负责独立复核：
+#
+#   · 用同一份规则（dnw-core.js）再算一次被举报的那一局，不采信前端给的结论；
+#   · 复核确认造假 → 删除这个人的成绩与对局数据（data/owners/<id>.json），
+#     从总榜移除，并在 data/voided.json 留一条指纹；
+#   · 复核不通过（分数其实对得上）→ 只标记驳回，不动成绩；
+#   · 处理完的举报记录会被删掉，避免仓库里越堆越多；
+#   · 每次都从 data/owners/ 重建 data/board.json（前 100 名）—— 总榜被手改也会被纠正；
+#     缺位的记录按「无记录」跳过，不影响其它人。
+#
+# 手动触发：Actions → 举报复核 → Run workflow
+# 本地也能跑：node tools/rebuild-board.js
+
+name: 举报复核
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'data/reports/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: leaderboard-data
+  cancel-in-progress: false
+
+jobs:
+  moderate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 复核举报并重建总榜
+        run: node tools/rebuild-board.js
+
+      - name: 提交结果
+        run: |
+          git config user.name "danaiwa-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A data
+          if git diff --cached --quiet; then
+            echo "没有变化"
+          else
+            git commit -m "举报复核：更新总榜与黑名单"
+            git pull --rebase --autostash origin main || true
+            git push
+          fi

@@ -1,0 +1,244 @@
+/* ============================================================
+ *  合成大奶娃 · 排行榜账本逻辑（UMD，纯函数、可单测）
+ *  ------------------------------------------------------------
+ *  数据库就是 GitHub 仓库本身：
+ *
+ *    data/board.json              总榜：前 100 名（每条只有摘要，很小）
+ *    data/owners/<玩家ID>.json    单个玩家的对局原始数据：
+ *                                 随机种子 + 动作序列（时间、投放位置）
+ *                                 + 过程快照 + 分数
+ *    data/voided.json             被抹除成绩的黑名单（只留指纹，不留数据）
+ *
+ *  规则（和需求一一对应）：
+ *    · 每人（按 IP 区分）在榜上只留最好成绩 —— 一个 IP 一个 owner 文件；
+ *    · 榜只记前 100 名，满了就顶掉分数最低的那位；
+ *    · 没进前 100 就不写 GitHub（客户端直接显示「101 · 无记录」）；
+ *    · 抹除成绩时把种子、动作序列一起删掉，只留一条「曾经因为什么被删」；
+ *    · 数据库要抗缺位：board.json 里缺 id/owner/分数都能正常渲染，
+ *      取不到 owner 文件就写「无记录」。
+ * ============================================================ */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory();
+  else root.DNWBoard = factory();
+})(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
+
+  var TOP_N = 100;                 // 总榜记录前 100
+  var NAME_MAX = 12;
+
+  function cleanName(raw) {
+    var n = String(raw == null ? '' : raw).replace(/[\u0000-\u001f\u007f]/g, '').trim();
+    if (n.length > NAME_MAX) n = n.slice(0, NAME_MAX);
+    return n || '匿名玩家';
+  }
+
+  /* 玩家标识：只存哈希，不存 IP 本身。
+     客户端为了「知道自己是谁」会自己去取公网 IP 再哈希；
+     拿不到 IP 时（离线、被拦）退化成浏览器本地随机 ID，
+     不影响玩，只是换设备就变成另一个人。 */
+  function hashIdentity(ip, salt) {
+    var s = String(ip == null ? '' : ip) + '|' + String(salt == null ? '' : salt);
+    var h1 = 2166136261 >>> 0, h2 = 2246822519 >>> 0;
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      h1 = Math.imul(h1 ^ c, 16777619) >>> 0;
+      h2 = Math.imul(h2 ^ c, 2654435761) >>> 0;
+      h2 = (h2 ^ (h2 >>> 13)) >>> 0;
+    }
+    return (h1.toString(36) + h2.toString(36)).padStart(13, '0').slice(0, 13);
+  }
+
+  /* 排序：分高的在前；同分先提交的在前（先到先得，也让名次稳定） */
+  function cmpEntry(a, b) {
+    if (b.score !== a.score) return b.score - a.score;
+    var ta = Number(a.submittedAt) || 0, tb = Number(b.submittedAt) || 0;
+    if (ta !== tb) return ta - tb;
+    return String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0;
+  }
+
+  function newBoard() {
+    return {
+      v: 1,
+      updatedAt: 0,
+      total: 0,
+      topN: TOP_N,
+      entries: []
+    };
+  }
+
+  /* 把任意读到的 JSON 变成能安全渲染的 board —— 缺字段、类型不对都不炸 */
+  function normalizeBoard(raw) {
+    var b = newBoard();
+    if (!raw || typeof raw !== 'object') return b;
+    b.updatedAt = Number(raw.updatedAt) || 0;
+    b.total = Number(raw.total) || 0;
+    if (Number(raw.topN) > 0) b.topN = Number(raw.topN);
+    var list = Array.isArray(raw.entries) ? raw.entries : [];
+    var seen = {};
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i];
+      if (!e || typeof e !== 'object') continue;          // 缺位 → 跳过，不炸
+      var score = Number(e.score);
+      if (!isFinite(score) || score < 0) continue;
+      var id = String(e.id == null ? '' : e.id);
+      if (!id || seen[id]) continue;                       // 同一个玩家只留一条
+      seen[id] = 1;
+      b.entries.push({
+        id: id,
+        owner: String(e.owner == null ? '' : e.owner),
+        name: cleanName(e.name),
+        score: score,
+        submittedAt: Number(e.submittedAt) || 0,
+        runId: String(e.runId == null ? '' : e.runId),
+        run: e.run && typeof e.run === 'object' ? e.run : null,
+        flags: Number(e.flags) || 0
+      });
+    }
+    b.entries.sort(cmpEntry);
+    if (b.entries.length > b.topN) b.entries = b.entries.slice(0, b.topN);
+    return b;
+  }
+
+  /* 够不够上榜。
+     规则和排序是同一条：榜没满就进；榜满了，必须在这个「总分序」里
+     排得比现有的第 100 名更靠前。同分比提交时间，先到的赢 ——
+     所以刚投出来的同分成绩挤不掉榜尾（先到先得）。
+     at（提交时间）不传时，按「时间上不占优」处理，结果最保守。 */
+  function qualifies(board, score, at) {
+    var s = Number(score);
+    if (!isFinite(s) || s <= 0) return false;
+    if (board.entries.length < board.topN) return true;
+    var last = board.entries[board.entries.length - 1];
+    var hasAt = at !== undefined && at !== null && isFinite(Number(at));
+    var key = { score: s, submittedAt: hasAt ? Number(at) : Infinity, id: '' };
+    return cmpEntry(key, last) < 0;
+  }
+
+  /* 我的名次：
+       已经在榜上 → 就是榜上那一行的名次；
+       否则按同一条总分序算出插进去会是第几；排不进前 100 就是 101
+       （页面按需求写「101 · 无记录」）。 */
+  function rankOf(board, id, score, at) {
+    if (score === undefined || score === null || !isFinite(Number(score))) return null;
+    var s = Number(score);
+
+    for (var i = 0; i < board.entries.length; i++) {
+      if (board.entries[i].id === id) return i + 1;
+    }
+    if (!qualifies(board, s, at)) return board.topN + 1;
+
+    var rank = 1;
+    for (var j = 0; j < board.entries.length; j++) {
+      if (board.entries[j].score > s) rank++;
+    }
+    return rank;
+  }
+
+  /* 写入一条成绩：同一个人只留最好的一次；榜满则顶掉最低那位。
+     返回 { board, entry, rank, made, replaced } —— replaced 是被顶掉的那位（没有则 null）。 */
+  function applyEntry(board, entry) {
+    var b = normalizeBoard(board);
+    var e = {
+      id: String(entry.id),
+      owner: String(entry.owner || ''),
+      name: cleanName(entry.name),
+      score: Number(entry.score) || 0,
+      submittedAt: Number(entry.submittedAt) || 0,
+      runId: String(entry.runId || ''),
+      run: entry.run || null,
+      flags: Number(entry.flags) || 0
+    };
+
+    var prevIdx = -1;
+    for (var i = 0; i < b.entries.length; i++) {
+      if (b.entries[i].id === e.id) { prevIdx = i; break; }
+    }
+
+    var prev = prevIdx >= 0 ? b.entries[prevIdx] : null;
+    var rank;
+    var replaced = null;
+
+    if (prev && prev.score >= e.score) {
+      /* 自己以前那次更好（或者一样），不动榜 —— 但名次照报 */
+      return { board: b, entry: prev, rank: prevIdx + 1, made: false, replaced: null, keptPrev: true };
+    }
+
+    if (prevIdx >= 0) b.entries.splice(prevIdx, 1);
+
+    b.entries.push(e);
+    b.entries.sort(cmpEntry);
+
+    if (b.entries.length > b.topN) {
+      replaced = b.entries.pop();       // 垫底的那位被顶出去
+    }
+
+    for (var k = 0; k < b.entries.length; k++) {
+      if (b.entries[k].id === e.id) { rank = k + 1; break; }
+    }
+    var made = rank !== undefined && rank <= b.topN;
+
+    return { board: b, entry: e, rank: made ? rank : b.topN + 1, made: made, replaced: replaced };
+  }
+
+  /* 抹除某个玩家的成绩（举报 → 复算不通过时用）。
+     数据（种子 / 动作序列 / 快照）全部丢掉，黑名单里只留证据摘要。 */
+  function voidEntry(board, id, info) {
+    var b = normalizeBoard(board);
+    var removed = null;
+    for (var i = 0; i < b.entries.length; i++) {
+      if (b.entries[i].id === id) { removed = b.entries.splice(i, 1)[0]; break; }
+    }
+    return {
+      board: b,
+      removed: removed,
+      record: {
+        id: String(id),
+        name: removed ? removed.name : '',
+        score: removed ? removed.score : 0,
+        at: Number(info && info.at) || 0,
+        reason: String((info && info.reason) || '复算不通过'),
+        verifier: String((info && info.verifier) || ''),
+        claim: (info && info.claim) || null
+      }
+    };
+  }
+
+  /* 名次徽章 */
+  function rankLabel(i) { return i < 3 ? ['🥇', '🥈', '🥉'][i] : String(i + 1); }
+
+  /* 没进榜的人横竖都显示这一句 */
+  var NO_RECORD = '101 · 无记录（未进总榜，本地不写入 GitHub）';
+
+  function formatScore(n) {
+    var v = Number(n);
+    if (!isFinite(v)) return '—';
+    return String(Math.round(v));
+  }
+
+  function timeAgo(ts, now) {
+    var t = Number(ts) || 0;
+    if (!t) return '';
+    var d = Math.max(0, (now === undefined ? Date.now() : now) - t) / 1000;
+    if (d < 60) return '刚刚';
+    if (d < 3600) return Math.floor(d / 60) + ' 分钟前';
+    if (d < 86400) return Math.floor(d / 3600) + ' 小时前';
+    return Math.floor(d / 86400) + ' 天前';
+  }
+
+  return {
+    TOP_N: TOP_N,
+    NO_RECORD: NO_RECORD,
+    cleanName: cleanName,
+    hashIdentity: hashIdentity,
+    cmpEntry: cmpEntry,
+    newBoard: newBoard,
+    normalizeBoard: normalizeBoard,
+    rankOf: rankOf,
+    qualifies: qualifies,
+    applyEntry: applyEntry,
+    voidEntry: voidEntry,
+    rankLabel: rankLabel,
+    formatScore: formatScore,
+    timeAgo: timeAgo
+  };
+});
