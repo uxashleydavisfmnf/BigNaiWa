@@ -161,8 +161,12 @@
     var replaced = null;
 
     if (prev && prev.score >= e.score) {
-      /* 自己以前那次更好（或者一样），不动榜 —— 但名次照报 */
-      return { board: b, entry: prev, rank: prevIdx + 1, made: false, replaced: null, keptPrev: true };
+      /* 自己以前那次更好（或者一样），不动榜 —— 但名次照报，
+         并把「没被替换」这件事告诉调用方，好让界面上给玩家一句解释。 */
+      return {
+        board: b, entry: prev, rank: prevIdx + 1, made: false, replaced: null,
+        keptPrev: true, prevScore: prev.score
+      };
     }
 
     if (prevIdx >= 0) b.entries.splice(prevIdx, 1);

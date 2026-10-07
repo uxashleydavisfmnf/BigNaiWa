@@ -334,6 +334,12 @@
         board = Board.normalizeBoard(res.data);
         boardAt = Date.now();
       }
+      /* 我这一局没进榜的话，数据库里不会留下痕迹；
+         把本机这一条留着，玩家还能在榜上看到自己"101 · 无记录" */
+      if (myEntry && !board.entries.some((e) => e.id === myEntry.id)) {
+        const m = board.entries.filter((e) => e.score < myEntry.score).length;
+        myEntry.rank = m + 1 > Board.TOP_N ? Board.TOP_N + 1 : m + 1;
+      }
       render();
       return board;
     }).catch((err) => {
@@ -392,14 +398,26 @@
         run: null
       };
       const applied = Board.applyEntry(board, provisional);
-      myEntry = {
+      /* 0 分不往榜上挂（也没意义） */
+      myEntry = score > 0 ? {
         id: id,
         name: provisional.name,
         score: score,
         submittedAt: at,
         rank: applied.rank
-      };
-      const madeLocal = applied.rank <= Board.TOP_N;
+      } : null;
+      /* 用 applied.made 而不是 rank <= 100：
+         被顶到 101 名、或者同分挤不掉别人的，都算"没进榜"，一个字节都不写 */
+      const madeLocal = score > 0 && applied.made;
+
+      if (applied.keptPrev) {
+        /* 榜上本来就有我更好的成绩：不用写库，也不用重试 */
+        setMsg('本局 ' + Board.formatScore(score) + ' 分，没有超过我自己的 ' +
+               Board.formatScore(applied.prevScore) + ' 分（榜上保留最好成绩）', '');
+        setSync('synced', '已同步 ✓');
+        render();
+        return;
+      }
 
       setMsg(madeLocal
         ? ('本局 ' + Board.formatScore(score) + ' 分，暂列第 ' + applied.rank + ' 名')
@@ -423,6 +441,27 @@
     submitting = true;
     showRetry(false);
 
+    /* 任何一条岔路都必须走到终态（已同步 / 无记录 / 失败），
+       不能停在「正在同步…」不动 —— 玩家会以为卡死了。 */
+    const finishLocal = (text) => {
+      submitting = false;
+      lastSubmitAt = Date.now();
+      try { localStorage.setItem(LAST_SUBMIT_KEY, String(lastSubmitAt)); } catch (e) { /* 忽略 */ }
+      setSync('local', text);
+      render();
+    };
+    const finishFail = (text) => {
+      submitting = false;
+      setSync('failed', text);
+      showRetry(true);
+    };
+
+    /* 分数为 0 的局（投两颗就完事）本来也没什么可上榜的 */
+    if (!(pendingRun.score > 0)) {
+      finishLocal('101 · 无记录（0 分不上榜）');
+      return;
+    }
+
     /* 1) 先自证：复算不过就根本不上传 */
     let selfCheck;
     try {
@@ -440,52 +479,59 @@
     }
 
     if (!madeLocal) {
-      submitting = false;
-      lastSubmitAt = Date.now();
-      try { localStorage.setItem(LAST_SUBMIT_KEY, String(lastSubmitAt)); } catch (e) { /* 忽略 */ }
-      setSync('local', '101 · 无记录（未进总榜，不写入 GitHub）');
-      render();
+      finishLocal(Board.NO_RECORD);
       return;
     }
 
-    /* 2) 上传：owner 文件 + 总榜 */
-    const owner = {
-      v: 1,
-      id: myId,
-      key: myKey,
-      name: pendingRun.name,
-      score: pendingRun.score,
-      runId: pendingRun.runId,
-      submittedAt: Date.now(),
-      run: Core.encodeRun(pendingRun.run),
-      verify: { verdict: selfCheck.verdict, replay: selfCheck.replayScore }
-    };
+    /* 2) 上传：owner 文件 + 总榜。身份还没解析完就先等它（最多等 8 秒）。 */
+    const withId = (myId || (pendingRun && pendingRun.id))
+      ? Promise.resolve(myId)
+      : Promise.race([
+          resolveIdentity(),
+          new Promise((r) => setTimeout(() => r(''), 8000))
+        ]);
 
-    let ownerSha = null;
-    readJson(ownerPath(myId))
-      .then((prev) => {
-        if (prev && prev.data && Number(prev.data.score) >= owner.score) {
-          /* 自己以前那次更好：对局数据不覆盖（榜上已经有那条了），
-             但总榜仍然要确认一下我的那一条在不在 —— 早退会让总榜漏写。 */
-          return null;
-        }
-        ownerSha = prev && prev.sha;
-        return writeJson(ownerPath(myId), owner, ownerSha, '成绩：' + owner.name + ' ' + owner.score + ' 分');
-      })
-      .then(() => pushBoardEntry(owner))
-      .then(() => {
-        submitting = false;
-        lastSubmitAt = Date.now();
-        try { localStorage.setItem(LAST_SUBMIT_KEY, String(lastSubmitAt)); } catch (e) { /* 忽略 */ }
-        setSync('synced', '已同步 ✓');
-        setMsg('已上榜 ✓　' + owner.name + ' · ' + Board.formatScore(owner.score) + ' 分', 'good');
-        return refresh();
-      })
-      .catch((err) => {
-        submitting = false;
-        setSync('failed', '同步失败：' + err.message);
-        showRetry(true);
-      });
+    withId.then((id) => {
+      if (!id) { finishFail('拿不到玩家标识，请点「重试提交」'); return; }
+      myId = myId || id;
+
+      const owner = {
+        v: 1,
+        id: myId,
+        key: myKey,
+        name: pendingRun.name,
+        score: pendingRun.score,
+        runId: pendingRun.runId,
+        submittedAt: pendingRun.at,
+        run: Core.encodeRun(pendingRun.run),
+        verify: { verdict: selfCheck.verdict, replay: selfCheck.replayScore }
+      };
+
+      let ownerSha = null;
+      return readJson(ownerPath(myId))
+        .then((prev) => {
+          if (prev && prev.data && Number(prev.data.score) >= owner.score) {
+            /* 自己以前那次更好：对局数据不覆盖（榜上已经有那条了），
+               但总榜仍然要确认一下我的那一条在不在 —— 提前结束会让总榜漏写。 */
+            return null;
+          }
+          ownerSha = prev && prev.sha;
+          return writeJson(ownerPath(myId), owner, ownerSha, '成绩：' + owner.name + ' ' + owner.score + ' 分');
+        })
+        .then(() => pushBoardEntry(owner))
+        .then(() => {
+          submitting = false;
+          lastSubmitAt = Date.now();
+          try { localStorage.setItem(LAST_SUBMIT_KEY, String(lastSubmitAt)); } catch (e) { /* 忽略 */ }
+          setSync('synced', '已同步 ✓');
+          /* 乐观名次已经显示了，这里不要把它覆盖掉 —— 只把"上传成功"说清楚 */
+          const rankTxt = myEntry && myEntry.rank <= Board.TOP_N ? ('暂列第 ' + myEntry.rank + ' 名') : '已上榜';
+          setMsg('已上榜 ✓　' + owner.name + ' · ' + Board.formatScore(owner.score) + ' 分（' + rankTxt + '）', 'good');
+          return refresh();
+        });
+    }).catch((err) => {
+      finishFail('同步失败：' + (err && err.message ? err.message : err));
+    });
   }
 
   /* 把成绩写进总榜：读最新 → 合并 → 写回；撞车了就重读重试 */
