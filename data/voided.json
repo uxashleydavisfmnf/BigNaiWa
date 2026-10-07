@@ -1,6 +1,19 @@
 {
   "v": 1,
-  "updatedAt": 1791390452994,
+  "updatedAt": 1791391583347,
   "note": "被抹除的成绩只在这里留一条指纹：谁、什么时候、报了多少分、复算出来多少、为什么删。对局数据（随机种子 / 动作序列 / 快照）已按规则一起删除。",
-  "records": []
+  "records": [
+    {
+      "id": "cheatzzzzzzzz",
+      "name": "作弊测试",
+      "score": 999999,
+      "at": 1791391583347,
+      "reason": "复算得分 234，与申报的 999999 不符",
+      "verdict": "fraud",
+      "replay": 234,
+      "delta": -999765,
+      "reports": 1,
+      "verifier": "github-actions/rebuild-board"
+    }
+  ]
 }
