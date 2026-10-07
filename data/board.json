@@ -1,1 +1,18 @@
-{"v": 1, "updatedAt": 1791393391616, "total": 2, "topN": 100, "entries": [{"id": "finalcheat001", "owner": "data/owners/finalcheat001.json", "name": "最终作弊测试", "score": 888888, "submittedAt": 1791393391616, "runId": "fake-final", "run": null, "flags": 0}, {"id": "0c680j0ieflrs", "owner": "data/owners/0c680j0ieflrs.json", "name": "验收测试", "score": 159, "submittedAt": 1791393370018, "runId": "muydcxry-3", "run": null, "flags": 0}]}
+{
+  "v": 1,
+  "updatedAt": 1791393434626,
+  "total": 1,
+  "topN": 100,
+  "entries": [
+    {
+      "id": "0c680j0ieflrs",
+      "owner": "data/owners/0c680j0ieflrs.json",
+      "name": "奶娃测试员",
+      "score": 234,
+      "submittedAt": 1791391512473,
+      "runId": "muyc8xc3-5",
+      "run": null,
+      "flags": 0
+    }
+  ]
+}
