@@ -1,4 +1,4 @@
-# 合成大奶娃
+﻿# 合成大奶娃
 
 > ### 🙏 原作者与出处
 >
@@ -109,7 +109,7 @@ python -m http.server 8080
 | `game.js` | 表现层：Canvas 渲染 + 输入 + WebAudio 音效 + 结算流程 |
 | `dnw-board.js` | **账本逻辑**：前 100、每人只留最好、抗缺位归一化、抹除 |
 | `leaderboard.js` | **排行榜前端**：本机乐观上榜、写 GitHub、同步状态、举报复算 |
-| `site-config.js` | 数据同步端点与访问凭据 |
+| `site-config.js` | 数据同步端点配置 |
 | `data/` | 数据库本体：`board.json`（前 100 名）、`owners/`（进榜者的对局数据）、`voided.json`（黑名单） |
 | `.github/workflows/moderate.yaml` | 举报自动复核 → 删数据 → 重建总榜 |
 | `assets/fruits/` | 水果贴图：`*.png` 是 512×512 的源图，页面实际加载的是 `*.webp`；另有 `parts.js` 碰撞形状、`blur.js` 极模糊占位图 |
@@ -398,7 +398,7 @@ data/reports/*.json         举报记录（复核完自动删除）
 | `dnw-core.js` | 确定性规则内核（UMD）：`createGame()` 开一局、`update()` 推进一步、`exportRun()` 导出存档、`validateRun()` 一键校验。浏览器和 Node 共用同一份 |
 | `dnw-board.js` | 账本逻辑（纯函数）：前 100 截断、每人只留最好、同分先到先得、抗缺位归一化、抹除与黑名单 |
 | `leaderboard.js` | 前端交互：本地乐观上榜 → 复算自检 → 写 owner 与总榜 → 轮询「已同步 ✓」；举报复算 |
-| `site-config.js` | 数据同步端点与访问凭据 |
+| `site-config.js` | 数据同步端点配置 |
 | `tools/rebuild-board.js` | 从 `data/owners/` 重建总榜 + 复核举报（Node，无依赖） |
 | `.github/workflows/moderate.yaml` | 有举报就自动复核、删数据、重建总榜并提交 |
 
