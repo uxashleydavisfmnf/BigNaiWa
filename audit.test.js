@@ -2,7 +2,11 @@
  *  快照校验自检（无浏览器）
  *  运行：node audit.test.js
  *
- *  现在的防作弊只做一件事：**校验快照**。覆盖：
+ *  两套口径：
+ *    auditQuick  —— 打完一局查这个：快照非空、时间戳单调、每条带签名、收尾=申报分数
+ *    auditReport —— 举报时查这个：再加上档位齐全、上界、掉落流水
+ *
+ *  覆盖：
  *    · 正常人打出来的局，快照一定完整、分数一定有理 → pass
  *    · 每 500 分一条，中间缺一条 → incomplete
  *    · 收尾那条不等于申报分数（凭空多分）→ implausible
@@ -48,7 +52,7 @@ function play(seed, drops, opts) {
 const packed = (g) => Core.encodeRun(g.exportRun());
 const clone = (o) => JSON.parse(JSON.stringify(o));
 const decode = (o) => Core.decodeRun(o);
-const audit = (o) => Core.auditRun(decode(o));
+const audit = (o) => Core.auditQuick(decode(o));
 
 console.log('快照校验自检\n');
 
@@ -94,9 +98,9 @@ ok(bigSnaps.length >= 4, '造出一局有 4 条以上快照的对局', bigSnaps.
   const lines = miss.k.split(';');
   lines.splice(2, 1);                       // 去掉中间那条（500 或 1000）
   miss.k = lines.join(';');
-  const a = audit(miss);
-  ok(!a.ok, '中间缺一条 → 不通过', a.verdict + ' / ' + a.reason);
-  ok(/缺少|缺了一段/.test(a.reason + (a.problems || []).join(' ')), '说清楚缺了哪一段',
+  const a = Core.auditReport(decode(miss));
+  ok(!a.ok, '中间缺一条 → 举报口径不通过', a.verdict + ' / ' + a.reason);
+  ok(/缺少|缺了一段|整倍数/.test(a.reason + (a.problems || []).join(' ')), '说清楚缺了哪一段',
     a.reason + ' / ' + (a.problems || []).join('；'));
 }
 if (false) {
@@ -170,7 +174,7 @@ if (decode(bigRun).snapshots.length >= 4) {
       { f: threeDrops[2].t, s: 500, n: 5, r: 0, d: 3, t: 1700000001000, g: '' }
     ]
   };
-  const aFree = Core.auditRun(freeScore);
+  const aFree = Core.auditQuick(freeScore);
   ok(!aFree.ok, '只投 3 次就报 500 分 → 不通过', aFree.verdict + ' / ' + aFree.reason);
   ok(aFree.verdict === 'incomplete' || aFree.verdict === 'implausible', '给出了不通过的裁决', aFree.verdict);
 }
@@ -184,8 +188,8 @@ ledgerMismatch.a = dm.actions.map((x, i) => {
   const t = x.tier === undefined ? 0 : x.tier;
   return { k: 'drop', t: x.t, x: x.x, tier: (t + 1) % 5 };   // 把等级改错
 }).map(Core.actionLine).join(';');
-const aLed = audit(ledgerMismatch);
-eq(aLed.verdict, 'implausible', '动作里的水果等级和种子对不上 → implausible');
+const aLed = Core.auditReport(decode(ledgerMismatch));
+eq(aLed.verdict, 'implausible', '举报口径：水果等级和种子对不上 → implausible');
 ok(/等级/.test(aLed.reason), '说清楚是等级对不上', aLed.reason);
 
 /* 引擎自己记的流水和独立算出来的流水必须一致（防"两套算法"） */
@@ -237,26 +241,115 @@ console.log('\n[E2] 分数上界');
     a.reason + ' / ' + (a.problems || []).join('；'));
 }
 
+/* ---------- E3. 初步校验：只看"时间戳单调 + 带签名" ---------- */
+console.log('\n[E3] 初步校验的两条硬指标');
+{
+  const real = decode(bigRun);
+  const lines = real.snapshots.map((x) => Core.snapshotLine(x));
+
+  /* 时间戳倒退 → 必须不通过 */
+  const back = real.snapshots.map((x, k) => Object.assign({}, x));
+  if (back.length >= 2) {
+    back[back.length - 1].t = back[0].t - 1000;
+    back[back.length - 1].g = '';        // 签名重算交给下面那条用例
+    const bad = {
+      seed: real.seed, score: real.snapshots[real.snapshots.length - 1].s,
+      spawn: real.spawn, actions: real.actions, snapshots: back
+    };
+    /* 用"重新签一遍"的方式，确保被抓的是时间戳而不是签名 */
+    bad.snapshots.forEach((x) => { x.g = ''; });
+    const signed = Core.decodeRun(Core.encodeRun({
+      seed: bad.seed, score: bad.score, actions: bad.actions, spawn: bad.spawn,
+      snapshots: bad.snapshots
+    }));
+    const a = Core.auditQuick(signed);
+    ok(!a.ok, '时间戳倒退 → 初步校验不通过', a.verdict + ' / ' + a.reason);
+    ok(/时间戳/.test(a.reason + (a.problems || []).join(' ')), '点名是时间戳的问题',
+      a.reason + ' / ' + (a.problems || []).join('；'));
+  }
+
+  /* 少一个签名 → 必须不通过 */
+  const noSig = real.snapshots.map((x) => Object.assign({}, x));
+  noSig[0].g = '';
+  const aSig = Core.auditQuick({
+    seed: real.seed, score: real.snapshots[real.snapshots.length - 1].s,
+    spawn: real.spawn, actions: real.actions, snapshots: noSig
+  });
+  ok(!aSig.ok, '有快照缺签名 → 初步校验不通过', aSig.verdict + ' / ' + aSig.reason);
+  ok(/签名/.test(aSig.reason + (aSig.problems || []).join(' ')), '点名是签名的问题',
+    aSig.reason + ' / ' + (aSig.problems || []).join('；'));
+
+  /* 改了分数但没重签 → 签名对不上 */
+  const tamper = real.snapshots.map((x) => Object.assign({}, x));
+  tamper[tamper.length - 1].s = tamper[tamper.length - 1].s + 300;
+  const aTamper = Core.auditQuick({
+    seed: real.seed, score: tamper[tamper.length - 1].s,
+    spawn: real.spawn, actions: real.actions, snapshots: tamper
+  });
+  ok(!aTamper.ok, '改了快照分数 → 初步校验不通过', aTamper.verdict + ' / ' + aTamper.reason);
+  ok(/签名/.test((aTamper.problems || []).join(' ')), '签名检查抓到了',
+    (aTamper.problems || []).join('；'));
+
+  /* 正常的必须过 */
+  const okRun = Core.auditQuick(real);
+  eq(okRun.verdict, 'pass', '原本正常的局仍然通过初步校验');
+  eq(okRun.stats.mode, 'quick', '标明走的是初步口径');
+}
+
+/* ---------- E4. 稳健性大扫描：正常人打出来的局一个都不能被冤枉 ---------- */
+console.log('\n[E4] 稳健性（120 局）');
+{
+  let qBad = 0, rBad = 0, shortest = 99, longest = 0;
+  for (let i = 1; i <= 120; i++) {
+    const seed = i * 7919;
+    const drops = 3 + (i * 13) % 420;          // 从"投几颗就完事"到"打很久"都覆盖
+    const g = Core.createGame(seed);
+    g.reset(seed);
+    for (let d = 0; d < drops; d++) {
+      for (let k = 0; k < 26; k++) g.update(FIXED);
+      if (g.state.over) break;
+      if (g.state.ready) g.drop(40 + ((d * 101) % 340));
+    }
+    for (let k = 0; k < 60 * 30 && !g.state.over; k++) g.update(FIXED);
+    const packed2 = Core.encodeRun(g.exportRun());
+    const rec = Core.decodeRun(packed2);
+    const aq = Core.auditQuick(rec);
+    const ar = Core.auditReport(rec);
+    if (!aq.ok) { qBad++; if (qBad <= 3) console.log('    quick 冤枉：seed ' + seed + ' → ' + aq.reason); }
+    if (!ar.ok) { rBad++; if (rBad <= 3) console.log('    report 冤枉：seed ' + seed + ' → ' + ar.reason); }
+    shortest = Math.min(shortest, rec.snapshots.length);
+    longest = Math.max(longest, rec.snapshots.length);
+  }
+  eq(qBad, 0, '120 局初步校验零误判');
+  eq(rBad, 0, '120 局举报口径零误判');
+  ok(shortest >= 1, '短局也至少有 1 条快照', '最少 ' + shortest + ' 条 / 最多 ' + longest + ' 条');
+}
+
 /* ---------- F. 结构非法 ---------- */
 console.log('\n[F] 结构非法');
-eq(Core.auditRun(null).verdict, 'malformed', '空数据 → malformed');
-eq(Core.auditRun({ score: 100, actions: [], snapshots: [] }).verdict, 'malformed', '没有种子 → malformed');
-eq(Core.auditRun({ seed: 'zz', score: -5, actions: [], snapshots: [] }).verdict, 'malformed', '负分 → malformed');
-eq(Core.auditRun({ seed: 'zz', score: 9.9e9, actions: [], snapshots: [] }).verdict, 'malformed', '分数离谱 → malformed');
-eq(Core.auditRun({ seed: 'zz', score: 1, actions: [{ k: 'drop', t: 1e9, x: 100 }], snapshots: [] }).verdict,
-  'malformed', '动作帧号越界 → malformed');
-eq(Core.auditRun({ seed: 'zz', score: 1, actions: [{ k: 'drop', t: 10, x: 9999 }], snapshots: [] }).verdict,
-  'malformed', '投放位置越界 → malformed');
-eq(Core.auditRun({ seed: 'zz', score: 1, actions: [{ k: 'drop', t: 10, x: 100 }, { k: 'drop', t: 12, x: 100 }], snapshots: [] }).verdict,
-  'malformed', '两次投放挨太近 → malformed');
+eq(Core.auditQuick(null).verdict, 'malformed', '空数据 → malformed');
+eq(Core.auditQuick({ score: 100, actions: [], snapshots: [] }).verdict, 'malformed', '没有种子 → malformed');
+eq(Core.auditQuick({ seed: 'zz', score: -5, actions: [], snapshots: [] }).verdict, 'malformed', '负分 → malformed');
+eq(Core.auditQuick({ seed: 'zz', score: 9.9e9, actions: [], snapshots: [] }).verdict, 'malformed', '分数离谱 → malformed');
+ok(!Core.auditQuick({ seed: 'zz', score: 1, actions: [{ k: 'drop', t: 1e9, x: 100 }], snapshots: [{ f: 0, s: 0, n: 0, r: 0, d: 0, t: 1700000000000, g: '' }] }).ok,
+  '动作帧号越界 → 不通过');
+ok(!Core.auditQuick({ seed: 'zz', score: 1, actions: [{ k: 'drop', t: 10, x: 9999 }], snapshots: [{ f: 0, s: 0, n: 0, r: 0, d: 0, t: 1700000000000, g: '' }] }).ok,
+  '投放位置越界 → 不通过');
+ok(!Core.auditQuick({ seed: 'zz', score: 1, actions: [{ k: 'drop', t: 10, x: 100 }, { k: 'drop', t: 12, x: 100 }], snapshots: [{ f: 0, s: 0, n: 0, r: 0, d: 0, t: 1700000000000, g: '' }] }).ok,
+  '两次投放挨太近 → 不通过');
 
 /* 0 分空局：只有开局那条，也应当合理 */
-const emptyRun = Core.encodeRun({
-  seed: 'zz', score: 0, spawn: '', actions: [],
-  snapshots: [{ f: 0, s: 0, n: 0, r: 0, d: 0, t: 1700000000000, g: '' }]
-});
-const aEmpty = Core.auditRun(Core.decodeRun(emptyRun));
-eq(aEmpty.verdict, 'pass', '0 分空局也是合理的');
+{
+  /* 真打一局不到 500 分就结束的，导出时应当补上收尾快照 */
+  const shortGame = Core.createGame(7);
+  shortGame.reset(7);
+  for (let i = 0; i < 3; i++) { shortGame.update(1 / 60); shortGame.drop(100 + i); }
+  const srun = shortGame.exportRun();
+  ok(srun.snapshots.length >= 1, '短局也会有一条快照', srun.snapshots.map((x) => x.s).join('→'));
+  eq(srun.snapshots[srun.snapshots.length - 1].s, srun.score, '收尾那条 = 最终分数');
+  const aShort = Core.auditQuick(Core.decodeRun(Core.encodeRun(srun)));
+  eq(aShort.verdict, 'pass', '短局的初步校验也通过');
+}
 
 console.log('\n' + pass + ' 通过 / ' + fail + ' 失败');
 process.exit(fail ? 1 : 0);

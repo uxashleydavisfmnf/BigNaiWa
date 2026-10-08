@@ -465,7 +465,7 @@
     /* 1) 先自检：快照不完整 / 分数没道理，就根本不上传 */
     let selfCheck;
     try {
-      selfCheck = Core.auditRun({
+      selfCheck = Core.auditQuick({
         seed: pendingRun.run.seed,
         score: pendingRun.score,
         actions: pendingRun.run.actions,
@@ -478,7 +478,7 @@
 
     if (!selfCheck.ok) {
       submitting = false;
-      setMsg('本局快照没通过自检，成绩留在本机：' + (selfCheck.reason || selfCheck.verdict), 'bad');
+      setMsg('本局快照没通过初步校验，成绩留在本机：' + (selfCheck.reason || selfCheck.verdict), 'bad');
       setSync('local', '未上传（快照不完整）');
       render();
       return;
@@ -616,7 +616,7 @@
       const claimed = Number(res.data.score) || Number(entry.score) || 0;
       rec.score = claimed;
 
-      const audit = Core.auditRun(rec);
+      const audit = Core.auditReport(rec);
 
       if (audit.ok) {
         stop('快照完整');

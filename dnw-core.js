@@ -20,7 +20,7 @@
  *    engine.drop(x) / engine.revive() → 玩家动作（会被记进动作序列）
  *    engine.takeSnapshot()            → 手动封存一个快照
  *    engine.exportRun()               → { seed, actions, snapshots, score, ... }
- *    auditRun(rec)                    → 只校验快照与掉落流水（1000 分只要几毫秒）
+ *    auditReport(rec)                    → 只校验快照与掉落流水（1000 分只要几毫秒）
  * ============================================================ */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
@@ -85,7 +85,7 @@
 
   var FIXED = 1 / 60;            // 逻辑步长；快照按帧号对齐
   var SNAP_STEP = 500;           // 每 500 分封一条快照
-  var SIG_KEY = 0x9E3779B1;      // 快照签名的混淆常量（只防手改，不是加密）
+  var SIG_KEY = 0x7f4a7c15;      // 快照签名的盐（只防手改，不是加密）
   var MAX_FRAMES = 60 * 60 * 60; // 一局最多这么多帧（1 小时 60fps），超过就不是人玩的
 
   /* ---------------------------------------------------------
@@ -129,16 +129,21 @@
    *  所有引擎结果一致 —— 所以它可以当校验的指纹用。
    * ------------------------------------------------------- */
 
-  /* 快照签名：把一条快照的关键字段揉成一个短标记。
-     它挡的是「手改 JSON 里的分数 / 时间戳」这种最低级的做法 ——
-     密钥在客户端，所以这不是加密，只是让手改成本变高。 */
-  function snapSig(seed, sn) {
-    var h = (seed >>> 0) ^ SIG_KEY;
-    var str = sn.f + '|' + sn.s + '|' + sn.n + '|' + sn.r + '|' + sn.t + '|' + (sn.d || 0);
+  /* 快照签名：把一条快照的字段揉成一个短标记。
+     它挡的是「手改 JSON 里的分数 / 时间戳」这种做法 ——
+     算法和盐都在客户端，所以这只是提高手改成本，不是加密。
+     只用快照自己的字段算，因此不拿种子也能校验（客户端与 Actions 结果一致）。 */
+  function snapSig(sn) {
+    var str = 'k' + SIG_KEY.toString(36) + '|' + sn.f + '|' + sn.s + '|' + sn.n + '|' +
+              sn.r + '|' + (sn.d || 0) + '|' + sn.t + '|v2';
+    var h = 5381;
     for (var i = 0; i < str.length; i++) {
-      h = Math.imul(h ^ str.charCodeAt(i), 16777619) >>> 0;
+      h = (Math.imul(h, 33) ^ str.charCodeAt(i)) >>> 0;
     }
-    return (h >>> 0).toString(36);
+    /* 再拌两轮，把相邻字段的变化扩散开 */
+    h = (Math.imul(h ^ (h >>> 15), 2246822519) >>> 0);
+    h = (Math.imul(h ^ (h >>> 13), 3266489917) >>> 0);
+    return ((h ^ (h >>> 16)) >>> 0).toString(36);
   }
 
   /* ---------------------------------------------------------
@@ -706,7 +711,7 @@
         t: Date.now(),
         g: ''
       };
-      sn.g = snapSig(seed, sn);
+      sn.g = snapSig(sn);
       snapshots.push(sn);
       state.lastSnapshot = sn;
       nextSnapScore = (Math.floor(score / SNAP_STEP) + 1) * SNAP_STEP;
@@ -784,10 +789,13 @@
     }
 
     function exportRun() {
-      /* 导出时补一条收尾快照：有些局不是"判负"结束的（玩家自己收了、
-         或者没到判负就先结算了），不补的话最后一条快照不等于最终分数，
-         校验会说数据不完整。 */
-      if (!snapshots.length || snapshots[snapshots.length - 1].s !== state.score) {
+      /* 导出时把收尾快照补上：
+         · 有些局不是"判负"结束的（自己收了 / 没到判负就结算了）；
+         · 一局没到 500 分的话，上面一条都还没封过。
+         不补的话最后一条快照不等于最终分数，初步校验就会说数据不完整。 */
+      if (!snapshots.length) {
+        pushSnap(state.score);
+      } else if (overFrame !== frame || snapshots[snapshots.length - 1].s !== state.score) {
         sealSnapshot(true);
       }
       return {
@@ -971,201 +979,176 @@
   }
 
   /* 一局分数的上界：把每次掉落的水果按"最理想的合成链"全合掉，能拿到多少分。
-     这是"白送分"最硬的挡板：申报分数一旦超过这个上界，就一定是编的。 */
-  function mergePotential(seed, drops) {
-    var ledger = spawnLedger(seed, drops);
-    var counts = [0, 0, 0, 0, 0, 0];
-    var i, k, total = 0;
-    for (i = 0; i < ledger.length; i++) {
-      var t = ledger[i];
-      if (t > 4) t = 4;
+     只在**举报**时才用（要拿种子推一遍流水，稍重一点）。
+     思路：每一级的水果两两合成，从最低级往上逐级配对，
+     留下的单个水果不可能自己合，所以这是个真上界。 */
+  function mergePotential(drops) {
+    var counts = [];
+    var i;
+    for (i = 0; i <= MAX_TIER; i++) counts.push(0);
+    for (i = 0; i < drops.length; i++) {
+      var t = drops[i];
+      if (t > MAX_TIER) t = MAX_TIER;
       counts[t]++;
-      /* 从这一级往上，找到第一个还空着的等级，放进去；沿途腾空的都算合掉 */
-      for (k = t; k <= 4; k++) {
-        if (counts[k] > 0) { counts[k]--; total += MERGE_SCORE[k + 1]; }
-        else { counts[k]++; break; }
-      }
     }
+    var total = 0;
+    var carry = 0;
+    for (var tier = 0; tier < MAX_TIER; tier++) {
+      var have = counts[tier] + carry;
+      var merges = Math.floor(have / 2);
+      total += merges * MERGE_SCORE[tier + 1];
+      carry = merges;                 // 合出来的这一级继续参与下一轮配对
+    }
+    /* 最高一级两两相撞会一起炸掉，额外加 MAX_BONUS */
+    total += Math.floor((counts[MAX_TIER] + carry) / 2) * MAX_BONUS;
     return total;
   }
 
-  function auditRun(rec) {
+  /* ---------------------------------------------------------
+   *  两条校验口径
+   *  ------------------------------------------------------------
+   *  auditQuick  —— 打完一局就查这个，故意放得很松：
+   *      · 有快照
+   *      · 时间戳单调不减
+   *      · 每条都带签名（改了字段签名就对不上）
+   *      · 收尾那条的分数 == 申报分数
+   *    另外只做最基础的结构检查（种子/分数/帧号别是乱的）。
+   *
+   *  auditReport —— 只在**举报**的时候查，严一点：
+   *     auditQuick 的全部，再加
+   *      · 档位齐全（500/1000/… 该有的都在，且不重复）
+   *      · 快照分数、投放次数单调不减
+   *      · 时间戳不能是荒唐的小值
+   *      · 分数不能超过"这些水果最多能合出多少分"的上界
+   *      · 每次投放的水果等级和种子推出来的流水一致（这条要有流水字段）
+   * ------------------------------------------------------- */
+
+  function quickProps(rec) {
     var problems = [];
-
-    /* ---- 结构 ---- */
-    if (!rec || typeof rec !== 'object') {
-      return { ok: false, verdict: 'malformed', reason: '没有对局数据', problems: ['no data'] };
-    }
-    if (rec.seed === undefined || rec.seed === null || rec.seed === '') {
-      return { ok: false, verdict: 'malformed', reason: '没有随机种子', problems: ['no seed'] };
-    }
+    if (!rec) { problems.push('没有对局数据'); return { problems: problems, snaps: [], actions: [], claimed: 0, seed: 0 }; }
     var claimed = Number(rec.score);
-    if (!isFinite(claimed) || claimed < 0 || claimed > 1e7) {
-      return { ok: false, verdict: 'malformed', reason: '分数不合法', problems: ['bad score'] };
-    }
-
-    var actions = (rec.actions || []).slice().sort(function (a, b) { return a.t - b.t; });
     var snaps = (rec.snapshots || []).slice().sort(function (a, b) { return a.f - b.f; });
+    var actions = (rec.actions || []).slice().sort(function (a, b) { return a.t - b.t; });
+    return { problems: problems, snaps: snaps, actions: actions, claimed: claimed, seed: strToSeed(rec.seed) };
+  }
 
-    if (actions.length > 6000) return { ok: false, verdict: 'malformed', reason: '动作数量异常', problems: ['too many actions'] };
-    if (snaps.length > 3000) return { ok: false, verdict: 'malformed', reason: '快照数量异常', problems: ['too many snapshots'] };
+  function auditQuick(rec) {
+    var ctx = quickProps(rec);
+    var problems = ctx.problems;
+    var snaps = ctx.snaps;
+    var claimed = ctx.claimed;
 
-    var lastDrop = -1e9;
-    var drops = 0;
-    var minGapFrames = Math.floor((DROP_MS / 1000) / FIXED) - 1;
-    for (var i = 0; i < actions.length; i++) {
-      var a = actions[i];
-      if (!a || !isFinite(a.t) || a.t < 0 || a.t > MAX_FRAMES) {
-        return { ok: false, verdict: 'malformed', reason: '动作帧号越界', problems: ['bad action frame'] };
-      }
-      if (a.k === 'drop') {
-        if (!isFinite(a.x) || a.x < WALL || a.x > W - WALL) {
-          return { ok: false, verdict: 'malformed', reason: '投放位置越界', problems: ['bad action x'] };
-        }
-        if (a.t - lastDrop < minGapFrames) {
-          return { ok: false, verdict: 'malformed', reason: '投放间隔小于冷却', problems: ['drops too close'] };
-        }
-        lastDrop = a.t;
-        drops++;
-      }
+    if (problems.length) return done('malformed', problems, ctx);
+    if (rec.seed === undefined || rec.seed === null || rec.seed === '') {
+      return done('malformed', ['没有随机种子'], ctx);
     }
-
-    if (!snaps.length) {
-      return { ok: false, verdict: 'incomplete', reason: '没有任何快照（数据不完整）', problems: ['no snapshot'] };
+    if (!isFinite(claimed) || claimed < 0 || claimed > 1e7) {
+      return done('malformed', ['分数不合法'], ctx);
     }
+    if (ctx.actions.length > 6000) return done('malformed', ['动作数量异常'], ctx);
+    if (!snaps.length) return done('incomplete', ['一条快照都没有'], ctx);
 
-
-    /* ---- 快照本身 ---- */
-    var prev = null;
-    for (var s = 0; s < snaps.length; s++) {
-      var sn = snaps[s];
-      if (!isFinite(sn.f) || sn.f < 0 || sn.f > MAX_FRAMES) {
-        return { ok: false, verdict: 'malformed', reason: '快照帧号越界', problems: ['bad snap frame'] };
-      }
-      if (!isFinite(sn.s) || sn.s < 0) {
-        return { ok: false, verdict: 'malformed', reason: '快照分数不合法', problems: ['bad snap score'] };
-      }
-      /* 时间戳不能早于游戏存在的年代（挡住明显编造/清零的时间戳）。
-         注意：时间戳是 0 的旧数据不在此列，只查"有值但荒唐"的。 */
-      if (sn.t > 0 && sn.t < 1577836800000) problems.push('快照时间戳不合理 @' + sn.f);
-      if (prev) {
-        if (sn.f < prev.f) problems.push('快照帧号倒退 @' + sn.f);
-        if (sn.s < prev.s) problems.push('快照分数倒退 @s' + sn.s);
-        if (sn.t && prev.t && sn.t < prev.t) problems.push('快照时间戳倒退 @' + sn.f);
-        if (sn.t && prev.t && sn.t - prev.t > MAX_GAP_MS) problems.push('相邻快照间隔过久 @' + sn.f);
-      }
-      prev = sn;
-    }
-
-    /* 第一条必须是 0 分：堵住"一上来就有一坨分" */
-    if (snaps[0].s !== 0) {
-      return { ok: false, verdict: 'implausible', reason: '第一条快照不是 0 分', problems: ['start score != 0'] };
-    }
-
-    /* 中间每条必须是 500 的整倍数，而且从 0 开始一条不落地往上走。
-       注意不能只看"相邻两条差 500"：把中间某条删掉、剩下两条正好差 1000 时，
-       光看相邻差是查不出来的 —— 得按档位逐条点名。 */
-    var expected = 0;
+    /* 时间戳单调不减 */
     for (var k = 1; k < snaps.length; k++) {
-      if (snaps[k].s % SNAP_STEP !== 0 && k < snaps.length - 1) {
-        problems.push('第 ' + (k + 1) + ' 条快照（s' + snaps[k].s + '）不是 ' + SNAP_STEP + ' 的整倍数');
+      if (!(snaps[k].t >= snaps[k - 1].t)) {
+        problems.push('时间戳不单调（第 ' + (k + 1) + ' 条比上一条早）');
       }
-      if (snaps[k].s - snaps[k - 1].s !== SNAP_STEP && k < snaps.length - 1) {
-        problems.push('快照之间缺了一段（s' + snaps[k - 1].s + ' → s' + snaps[k].s + '）');
-      }
-    }
-    /* 该有的档位必须都在：0、500、1000、……、一直到"不超过最终分数的最大整倍数"。
-       例：最终 928 分 → 必须有 0 和 500 两条；最终正好 1000 分 → 必须有 0/500/1000。 */
-    var topBucket = claimed > 0 ? Math.floor((claimed - 1) / SNAP_STEP) * SNAP_STEP : 0;
-    var have = {};
-    for (var q2 = 0; q2 < snaps.length; q2++) have[snaps[q2].s] = true;
-    for (var b = 0; b <= topBucket; b += SNAP_STEP) {
-      if (!have[b]) problems.push('缺少 ' + b + ' 分那条快照');
-    }
-
-    /* 最后一条就是收尾那条：它必须正好等于申报分数 */
-    var lastSnap = snaps[snaps.length - 1];
-    if (lastSnap.s !== claimed) {
-      return {
-        ok: false, verdict: 'implausible',
-        reason: '最后一条快照是 ' + lastSnap.s + ' 分，申报的却是 ' + claimed + ' 分',
-        problems: ['final snapshot != claimed']
-      };
-    }
-    /* 收尾那条不能比前一条整倍数还低 */
-    if (snaps.length >= 2 && lastSnap.s < snaps[snaps.length - 2].s) {
-      problems.push('收尾快照比前一条还低');
-    }
-
-    /* ---- 分数有理（一）：投放次数要和分数对得上（累计口径）----
-       注意不能按"每一段涨了多少就要求这一段投了几次"来判：
-       水果落下来之后还会继续合成，收尾那几分完全可能是早先投下去的果子自己合的。
-       正确的说法是累计的：要拿到 S 分，总共至少得投过 ceil(S / 每次投放的分数上限) 次。
-       再要求投放次数单调不减（这是必须成立的）。 */
-    for (var q = 1; q < snaps.length; q++) {
-      if ((snaps[q].d || 0) < (snaps[q - 1].d || 0)) {
-        problems.push('快照里的投放次数倒退（d' + snaps[q - 1].d + ' → d' + snaps[q].d + '）');
-      }
-    }
-    for (var q3 = 0; q3 < snaps.length; q3++) {
-      var needTotal = Math.ceil(snaps[q3].s / MAX_SCORE_PER_DROP);
-      if ((snaps[q3].d || 0) < needTotal) {
-        problems.push('s' + snaps[q3].s + ' 分时只投放了 ' + (snaps[q3].d || 0) +
-                      ' 次（这个分数至少需要 ' + needTotal + ' 次）');
-      }
-    }
-    /* 快照里的投放次数不能超过动作序列里的总投放次数 */
-    if (snaps[snaps.length - 1].d > drops) {
-      problems.push('快照说我投了 ' + snaps[snaps.length - 1].d + ' 次，动作序列里只有 ' + drops + ' 次');
-    }
-    /* ---- 分数有理（二）：分数不能超过"这些水果最多能合出多少分" ---- */
-    if (drops > 0 && drops <= 6000) {
-      var cap = mergePotential(strToSeed(rec.seed), drops);
-      if (claimed > cap) {
-        return {
-          ok: false, verdict: 'implausible',
-          reason: '申报 ' + claimed + ' 分，但 ' + drops + ' 次投放最多只能合出 ' + cap + ' 分',
-          problems: ['score above merge potential (' + claimed + ' > ' + cap + ')']
-        };
+      if ((snaps[k].s || 0) < (snaps[k - 1].s || 0)) {
+        problems.push('快照分数倒退（s' + snaps[k - 1].s + ' → s' + snaps[k].s + '）');
       }
     }
 
-    /* 每条快照的签名：手改过分数/时间戳就会对不上（只报提示，不当硬门槛） */
-    var badSig = 0;
-    for (var sg = 0; sg < snaps.length; sg++) {
-      var one = snaps[sg];
-      if (one.g && one.g !== snapSig(strToSeed(rec.seed), one)) badSig++;
+    /* 每条都要有签名，而且签名要对得上（手改字段就会对不上） */
+    for (var q = 0; q < snaps.length; q++) {
+      var sn = snaps[q];
+      if (!sn.g) { problems.push('第 ' + (q + 1) + ' 条快照没有签名'); continue; }
+      if (sn.g !== snapSig(sn)) { problems.push('第 ' + (q + 1) + ' 条快照的签名对不上（可能被改过）'); }
     }
-    if (badSig) problems.push('有 ' + badSig + ' 条快照的签名对不上（疑似被手改）');
 
-    /* ---- 掉落流水：每次投放的等级必须和种子推出来的一致 ---- */
-    if (drops > 0) {
-      var ledger = rec.spawn && rec.spawn.length >= drops
-        ? rec.spawn.split('').map(function (c) { return parseInt(c, 36); })
-        : spawnLedger(strToSeed(rec.seed), drops);
-      var idx = 0;
-      var mismatches = 0;
-      for (var m = 0; m < actions.length; m++) {
-        if (actions[m].k !== 'drop') continue;
-        if (actions[m].tier === undefined) continue;      // 老数据没有等级字段，跳过这条检查
-        if (actions[m].tier !== ledger[idx]) mismatches++;
-        idx++;
-      }
-      if (mismatches > 0) {
-        return {
-          ok: false, verdict: 'implausible',
-          reason: '有 ' + mismatches + " 次投放的水果等级和这个种子对不上",
-          problems: ['spawn ledger mismatch x' + mismatches]
-        };
-      }
+    /* 收尾那条的分数必须等于申报分数 */
+    if (snaps[snaps.length - 1].s !== claimed) {
+      problems.push('最后一条快照是 ' + snaps[snaps.length - 1].s + ' 分，申报的却是 ' + claimed + ' 分');
     }
 
     if (problems.length) {
-      return { ok: false, verdict: 'incomplete', reason: problems[0], problems: problems };
+      var hard = problems.some(function (p) { return p.indexOf('签名') < 0; });
+      return done(hard ? 'implausible' : 'incomplete', problems, ctx);
     }
     return {
       ok: true, verdict: 'pass', reason: '', problems: [],
-      stats: { drops: drops, snapshots: snaps.length, claimed: claimed, lastFrame: lastSnap.f }
+      stats: { snapshots: snaps.length, claimed: claimed, mode: 'quick' }
+    };
+  }
+
+  function auditReport(rec) {
+    var quick = auditQuick(rec);
+    var ctx = quickProps(rec);
+    var snaps = ctx.snaps;
+    var claimed = ctx.claimed;
+    var problems = (quick.problems || []).slice();
+
+    /* 结构明显有问题就直接回（不用再往下算上界） */
+    if (quick.verdict === 'malformed') return quick;
+
+    /* 每条中间快照都该是 500 的整倍数，且一条不落、不重复；
+       收尾那条是实际分数（可以不是整倍数）。 */
+    var seen = {};
+    for (var k = 0; k < snaps.length; k++) {
+      var sn = snaps[k];
+      if (sn.t > 0 && sn.t < 1577836800000) problems.push('快照时间戳不合理（第 ' + (k + 1) + ' 条）');
+      if (k < snaps.length - 1) {
+        if (sn.s % SNAP_STEP !== 0) problems.push('第 ' + (k + 1) + ' 条快照（s' + sn.s + '）不是 ' + SNAP_STEP + ' 的整倍数');
+        if (seen[sn.s]) problems.push('档位重复（s' + sn.s + ' 出现两次）');
+        seen[sn.s] = 1;
+      }
+      if (k > 0 && (sn.d || 0) < (snaps[k - 1].d || 0)) problems.push('快照里的投放次数倒退');
+    }
+    for (var b = 0; b < claimed; b += SNAP_STEP) {
+      if (!seen[b] && b !== snaps[snaps.length - 1].s) problems.push('缺少 ' + b + ' 分那条快照');
+    }
+
+    /* 上界：用种子推出这么多步的水果，最多能合出多少分 */
+    var drops = snaps[snaps.length - 1].d || 0;
+    if (!drops) drops = ctx.actions.filter(function (a) { return a.k === 'drop'; }).length;
+    if (drops > 0 && drops <= 6000) {
+      var cap = mergePotential(spawnLedger(ctx.seed, drops));
+      if (claimed > cap) {
+        problems.push('申报 ' + claimed + ' 分，但这些水果（' + drops + ' 步）最多只能合出 ' + cap + ' 分');
+      }
+    }
+
+    /* 掉落流水：每次投放的等级要和种子推出来的一致 */
+    var tiered = ctx.actions.filter(function (a) { return a.k === 'drop' && a.tier !== undefined; });
+    if (tiered.length >= 8) {
+      var ledger = spawnLedger(ctx.seed, tiered.length);
+      var bad = 0;
+      for (var m = 0; m < tiered.length; m++) if (tiered[m].tier !== ledger[m]) bad++;
+      if (bad > 0) problems.push('有 ' + bad + ' 次投放的水果等级和这个种子对不上');
+    }
+
+    if (!problems.length) {
+      return {
+        ok: true, verdict: 'pass', reason: '', problems: [],
+        stats: { snapshots: snaps.length, drops: drops, claimed: claimed, cap: drops ? mergePotential(spawnLedger(ctx.seed, drops)) : null, mode: 'report' }
+      };
+    }
+    return {
+      ok: false,
+      /* 等级对不上 / 签名对不上 / 超过上界 —— 都算「数据是编的」；其余算「数据不全」 */
+      verdict: problems.some(function (p) {
+        return p.indexOf('签名') >= 0 || p.indexOf('上界') >= 0 ||
+               p.indexOf('等级') >= 0 || p.indexOf('最多只能合出') >= 0;
+      }) ? 'implausible' : 'incomplete',
+      reason: problems[0],
+      problems: problems,
+      stats: { snapshots: snaps.length, drops: drops, claimed: claimed, mode: 'report' }
+    };
+  }
+
+  function done(verdict, problems, ctx) {
+    return {
+      ok: false, verdict: verdict, reason: problems[0] || verdict,
+      problems: problems, stats: { snapshots: (ctx.snaps || []).length, claimed: ctx.claimed || 0 }
     };
   }
 
@@ -1175,7 +1158,8 @@
 
   return {
     createGame: createGame,
-    auditRun: auditRun,              // 只校验快照与掉落流水，不做校验
+    auditQuick: auditQuick,          // 打完一局查这个（松：时间戳单调 + 带签名）
+    auditReport: auditReport,        // 举报时查这个（严：加上界与掉落流水）
     spawnLedger: spawnLedger,
     setShapes: setShapes,
     shapeOf: shapeOf,

@@ -108,7 +108,7 @@ function moderate() {
     try {
       const rec = Core.decodeRun(owner.run);
       rec.score = Number(owner.score) || 0;
-      verdict = Core.auditRun(rec);
+      verdict = Core.auditReport(rec);
     } catch (e) {
       verdict = { verdict: 'malformed', ok: false, reason: '校验异常：' + e.message };
     }
@@ -189,7 +189,7 @@ function rebuild() {
       try {
         const rec = Core.decodeRun(owner.run);
         rec.score = score;
-        v = Core.auditRun(rec);
+        v = Core.auditReport(rec);
       } catch (e) {
         v = { ok: false, verdict: 'malformed', reason: '校验异常：' + e.message };
       }
