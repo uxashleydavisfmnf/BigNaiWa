@@ -220,9 +220,23 @@ let seed = 7;
 function nx() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return 0.15 + (seed % 1000) / 1000 * 0.7; }
 let escaped = '';
 let worstPen = 0, worstTier = -1;
+/* 同时盯住合成：球数应该"少掉一颗"（两颗变一颗），而且分数要涨。
+   只看"有分数"是不够的 —— 两颗都消失、分数照加，也能满足那个断言。 */
+let mergesSeen = 0, dropsSeen = 0, scoreJump = 0, vanished = 0;
 for (let i = 0; i < 60; i++) {
+  const beforeCount = S.balls.length;
+  const beforeScore = Number(els.score.textContent) || 0;
   down({ clientX: nx() * W, clientY: 120, pointerType: 'mouse' });
+  dropsSeen++;
   pump(30);
+  const afterCount = S.balls.length;
+  const afterScore = Number(els.score.textContent) || 0;
+  if (afterCount < beforeCount) {
+    mergesSeen++;
+    scoreJump += (afterScore - beforeScore);
+  }
+  /* 球少了两颗以上、分数却没涨 —— 那才是"合成凭空消失" */
+  if (beforeCount - afterCount >= 2 && afterScore === beforeScore) vanished++;
   for (const b of S.balls) {
     const pen = bounds(b).maxy - (H - WALL);
     if (pen > worstPen) { worstPen = pen; worstTier = b.tier; }
@@ -230,6 +244,10 @@ for (let i = 0; i < 60; i++) {
   }
 }
 pump(600);
+check('60 次投放确实发生了合成', mergesSeen >= 3, '观察到 ' + mergesSeen + ' 次合成（' + dropsSeen + ' 次投放）');
+check('合成让盘子里的球变少（两颗变一颗，不是两颗都消失）', vanished === 0,
+  '异常消失次数 = ' + vanished);
+check('合成累计得分与合成次数相符', scoreJump > 0, '合成带来 ' + scoreJump + ' 分');
 /* 落定之后再量一次：这里必须严格，静止了还穿就是真沉下去了 */
 let settledBad = '';
 for (const b of S.balls) if (!settledBad) settledBad = outOfBounds(b, 0.5);

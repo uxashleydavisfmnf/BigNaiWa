@@ -220,5 +220,79 @@ eq(G.state.freeze, 0, '倒计时结束后归零');
 G.update(1 / 60);
 eq(G.state.freeze, 0, '之后正常走更新，不报错');
 
+/* ---------- G. 普通合成：新水果必须真的出现在场地里 ----------
+   这是最容易写错、也最容易被漏测的一条：
+   两颗同级相撞 → 两颗消失、**升级的那颗必须在场**、分数按三角数加。
+   只测「两颗消失了」是不够的 —— 那样"合成凭空消失"也能通过。 */
+console.log('\n[G] 普通合成（升级）');
+function mergeScenario(tier) {
+  G.reset();
+  G.state.balls.length = 0;
+  const r = G.FRUITS[tier].r;
+  const a = G.makeBall(210, 520, tier, 0, 0);
+  a.landed = true; a.py = a.y;
+  const b = G.makeBall(210, 520 - (2 * r + 0.6), tier, 0, 0);
+  b.landed = true; b.py = b.y;
+  G.state.balls.push(a, b);
+  const scoreBefore = G.state.score;
+  let settled = false;
+  for (let i = 0; i < 120 && !settled; i++) {
+    G.stepPhysics(1 / 60);
+    if (G.state.balls.length !== 2) settled = true;
+  }
+  return { before: scoreBefore, settled: settled };
+}
+
+for (const tier of [0, 1, 2, 3, 4]) {
+  const r = mergeScenario(tier);
+  const bans = G.state.balls;
+  eq(bans.length, 1, 'tier' + tier + '：合成后场上正好剩 1 颗（不是 0 颗）');
+  eq(bans[0].tier, tier + 1, 'tier' + tier + '：升级成了 tier' + (tier + 1));
+  eq(G.state.score - r.before, [0, 1, 3, 6, 10, 15][tier + 1],
+    'tier' + tier + '：加了 ' + [0, 1, 3, 6, 10, 15][tier + 1] + ' 分');
+  ok(Math.abs(bans[0].x - 210) < 3, 'tier' + tier + '：新水果落在两颗原来的中间', 'x=' + bans[0].x.toFixed(1));
+  ok(bans[0].y > 0 && bans[0].y < 700 - 10, 'tier' + tier + '：新水果在场地内', 'y=' + bans[0].y.toFixed(1));
+}
+
+/* 连合成一棵高等级的水果：连续升三级，每一级都得在场上 */
+console.log('  连升：两颗 tier2 合成 tier3，再合 tier4 …');
+G.reset();
+G.state.balls.length = 0;
+function put(x, y, tier) {
+  const b = G.makeBall(x, y, tier, 0, 0);
+  b.landed = true; b.py = b.y;
+  G.state.balls.push(b);
+  return b;
+}
+put(210, 560, 2);
+put(210, 560 - (2 * G.FRUITS[2].r + 0.6), 2);
+mergeScenarioStep();
+function mergeScenarioStep() {
+  for (let i = 0; i < 120 && G.state.balls.length !== 1; i++) G.stepPhysics(1 / 60);
+}
+eq(G.state.balls.length, 1, '第一次合成后剩 1 颗');
+eq(G.state.balls[0].tier, 3, '升到 tier3');
+put(210, G.state.balls[0].y - (2 * G.FRUITS[3].r + 0.6), 3);
+for (let i = 0; i < 180 && G.state.balls.length !== 1; i++) G.stepPhysics(1 / 60);
+eq(G.state.balls.length, 1, '第二次合成后还是剩 1 颗（没有凭空消失）');
+eq(G.state.balls[0].tier, 4, '继续升到 tier4');
+
+/* 贴着左右墙合成也要夹回场地内，而且新水果必须是活着的 */
+console.log('  贴墙合成：新水果不能被顶出场地');
+for (const wallX of [G.FRUITS[1].r + 11, 420 - 10 - G.FRUITS[1].r - 1]) {
+  G.reset();
+  G.state.balls.length = 0;
+  const r1 = G.FRUITS[1].r;
+  const c = G.makeBall(wallX, 600, 1, 0, 0); c.landed = true; c.py = c.y;
+  const d = G.makeBall(wallX, 600 - (2 * r1 + 0.6), 1, 0, 0); d.landed = true; d.py = d.y;
+  G.state.balls.push(c, d);
+  for (let i = 0; i < 120 && G.state.balls.length !== 1; i++) G.stepPhysics(1 / 60);
+  eq(G.state.balls.length, 1, '贴墙合成后剩 1 颗');
+  const nb = G.state.balls[0];
+  eq(nb.tier, 2, '升级到 tier2');
+  ok(nb.x - nb.r >= 10 - 1.5 && nb.x + nb.r <= 410 + 1.5,
+    '新水果没有卡进墙里', 'x=' + nb.x.toFixed(1) + ' r=' + nb.r);
+}
+
 console.log('\n' + pass + ' 通过 / ' + fail + ' 失败');
 process.exit(fail ? 1 : 0);

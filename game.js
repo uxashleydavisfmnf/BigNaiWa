@@ -181,7 +181,12 @@
     if (x !== undefined) state.floats.push({ x, y, text: text || ('+' + n), life: 1 });
   };
 
-  engine.hooks.onMerge = (tier, x, y) => {
+  engine.hooks.onMerge = (tier, x, y, ball) => {
+    /* 出生动画：合成出来的这颗要"弹一下"，而且它的出生时间就是现在 */
+    if (ball) {
+      ball.popAt = performance.now();
+      ball.bornAt = performance.now();
+    }
     Sound.merge(tier);
     haptic(6 + tier);
   };
@@ -699,10 +704,10 @@
     const tier = state.pending;
     const from = state.aimX;
     if (!engine.drop(state.aimX)) return false;
+    /* 刚投下去那颗的出生时间（只用于渲染，内核靠帧号） */
+    const fresh = state.balls[state.balls.length - 1];
+    if (fresh) fresh.bornAt = performance.now();
     lastDropTier = tier;
-    if (window.DanaiwaBoard && window.DanaiwaBoard.onDrop) {
-      window.DanaiwaBoard.onDrop(engine.getFrame(), state.aimX, tier, from);
-    }
     Sound.drop();
     drawNext();
     return true;

@@ -505,7 +505,13 @@
           nb.py = nb.y;
           nb.landed = true;
           nb.bornFrame = frame;
-          if (hooks.onMerge) hooks.onMerge(nt, mx, my);
+          /* 关键：合成出来的新水果必须真的放进场地里。
+             少了这一行，两颗水果会被下面的 alive 过滤掉、新的这颗又没进数组，
+             结果就是「合成一下两颗都消失了」。 */
+          state.balls.push(nb);
+          /* 把新水果一起交给表现层：它要给它打出生动画（popAt / bornAt），
+             这两个字段只影响画面、不参与物理。 */
+          if (hooks.onMerge) hooks.onMerge(nt, mx, my, nb);
           addScore(MERGE_SCORE[nt], mx, my, '+' + MERGE_SCORE[nt]);
           burst(mx, my, nt, 8 + nt * 2, 140 + nt * 22);
           if (nt === MAX_TIER) state.flash = 1;
@@ -841,9 +847,11 @@
     var scoreTol = opts.scoreTolerance === undefined ? 0 : opts.scoreTolerance;
     var every = opts.yieldEvery || 90;          // 每多少帧交还一次主线程
 
-    if (!rec || rec.seed === undefined || rec.seed === null) {
-      return { ok: false, verdict: 'malformed', reason: '缺少随机种子', replayScore: 0, claimed: 0, delta: 0, frameErrors: [] };
+    function bad(reason) {
+      return { ok: false, verdict: 'malformed', reason: reason, replayScore: 0, claimed: 0, delta: 0, frameErrors: [] };
     }
+
+    if (!rec || rec.seed === undefined || rec.seed === null) return bad('缺少随机种子');
 
     var seed = strToSeed(rec.seed);
     var actions = (rec.actions || []).slice().sort(function (a, b) { return a.t - b.t; });
@@ -859,16 +867,10 @@
     var frameErrors = [];
     for (var i = 0; i < actions.length; i++) {
       var a = actions[i];
-      if (a.t < 0 || a.t > MAX_FRAMES) {
-        return { ok: false, verdict: 'malformed', reason: '动作时间越界', replayScore: 0, claimed: claimed, delta: 0, frameErrors: [] };
-      }
+      if (a.t < 0 || a.t > MAX_FRAMES) return bad('动作时间越界');
       if (a.k === 'drop') {
         if (a.t - lastDrop < minGapFrames) {
-          return {
-            ok: false, verdict: 'malformed',
-            reason: '投放间隔小于冷却（' + (a.t - lastDrop) + ' 帧 < ' + minGapFrames + '）',
-            replayScore: 0, claimed: claimed, delta: 0, frameErrors: []
-          };
+          return bad('投放间隔小于冷却（' + (a.t - lastDrop) + ' 帧 < ' + minGapFrames + '）');
         }
         lastDrop = a.t;
       }
@@ -878,30 +880,50 @@
     for (var j = 0; j < actions.length; j++) maxFrame = Math.max(maxFrame, actions[j].t);
     maxFrame += 2;
 
-    var si = 0;
-    var ai = 0;
-    var guard = 0;
-    var sinceYield = 0;
+    /* ---------- 快照对齐 ----------
+       关于「第 F 帧的快照记的是推进前还是推进后」：两条路都有——
+       常规快照是 update() 里物理推进之后封的；判负那条是 checkGameOver() 里封的，
+       而那一帧的帧号可能停在推进之前（定格/结束分支会提前 return，不再推进物理）。
+       为了不因这一点相位差把真实成绩误判成篡改，同一帧的两种状态都比一次，
+       命中任意一个就算对得上。想伪造仍然要同时骗过相邻两帧的完整状态指纹。 */
+    var pending = [];        // 当前帧待判的快照
+    var si = 0;              // 下一条要取出的快照
+    var ai = 0;              // 下一条要执行的动作
 
-    /* 复算主循环：每帧先对齐快照，再执行这一帧的动作 */
-    while (guard++ < maxFrame + 600) {
-      var f = g.getFrame();
-
-      while (si < snaps.length && snaps[si].f === f) {
-        var sn = snaps[si];
-        if (sn.s !== g.state.score) {
-          frameErrors.push({ f: f, kind: 'score', claimed: sn.s, actual: g.state.score });
-        } else if (sn.h !== hashBalls(g.state.balls)) {
-          frameErrors.push({ f: f, kind: 'hash', claimed: sn.h, actual: hashBalls(g.state.balls) });
-        }
-        si++;
+    function trySnap(sn) {
+      if (sn.s !== g.state.score) {
+        frameErrors.push({ f: sn.f, kind: 'score', claimed: sn.s, actual: g.state.score });
+        return true;
       }
+      if (sn.h === hashBalls(g.state.balls)) return true;
+      return false;
+    }
 
-      while (ai < actions.length && actions[ai].t === f) {
+    function collect(frameNow) {
+      while (si < snaps.length && snaps[si].f === frameNow) pending.push(snaps[si++]);
+    }
+
+    function judge(frameNow) {
+      var rest = [];
+      for (var k = 0; k < pending.length; k++) {
+        var sn = pending[k];
+        if (trySnap(sn)) continue;      // 命中（或分数直接错了）
+        rest.push(sn);                  // 这一相位没命中，留到下一相位再试
+      }
+      pending = rest;
+      /* 已经越过这一帧还没命中的，判定为过程数据对不上 */
+      while (pending.length && pending[0].f < frameNow) {
+        var miss = pending.shift();
+        frameErrors.push({ f: miss.f, kind: 'hash', claimed: miss.h, actual: hashBalls(g.state.balls) });
+      }
+    }
+
+    function applyActions(frameNow) {
+      while (ai < actions.length && actions[ai].t === frameNow) {
         var act = actions[ai];
         if (act.k === 'drop') {
           if (!g.state.ready) {
-            frameErrors.push({ f: f, kind: 'cooldown', claimed: 0, actual: 0 });
+            frameErrors.push({ f: frameNow, kind: 'cooldown', claimed: 0, actual: 0 });
           }
           g.drop(act.x);
         } else if (act.k === 'revive') {
@@ -909,18 +931,40 @@
         }
         ai++;
       }
+    }
 
-      if (si >= snaps.length && ai >= actions.length) break;
+    var guard = 0;
+    var sinceYield = 0;
+
+    while (guard++ < maxFrame + 600) {
+      var f = g.getFrame();
+      collect(f);            // ① 推进前
+      judge(f);
+      applyActions(f);
+
+      if (si >= snaps.length && ai >= actions.length) {
+        /* 都放完了：再推进一步，把最后一帧"推进后"的状态也判掉 */
+        g.update(FIXED);
+        judge(g.getFrame());
+        break;
+      }
+
       g.update(FIXED);
+      judge(g.getFrame());   // ② 推进后
 
       if (++sinceYield >= every) {
         sinceYield = 0;
-        yield f;                                  // 交还主线程，下次从这里接着算
+        yield f;             // 交还主线程，下次从这里接着算
       }
     }
 
-    /* 动作放完之后再空跑两秒，让盘面落定，避免「最后一颗还在空中」导致误判 */
-    for (var w = 0; w < 120; w++) g.update(FIXED);
+    /* 收尾：万一还有没判完的快照（比如数据被截断），直接用当前状态收口 */
+    if (pending.length) {
+      for (var p = 0; p < pending.length; p++) {
+        frameErrors.push({ f: pending[p].f, kind: 'hash', claimed: pending[p].h, actual: hashBalls(g.state.balls) });
+      }
+      pending = [];
+    }
 
     var replayScore = g.state.score;
     var delta = replayScore - claimed;
