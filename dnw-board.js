@@ -136,6 +136,40 @@
     return rank;
   }
 
+  /* 这个分数能不能进榜 —— 判的时候先把"我自己"从榜上摘掉。
+     为什么不直接看现成的那条：如果我已经在榜上，而这一局没超过我自己，
+     现有实现会把"没被替换"当成"没进榜"，两者是两回事：
+       · 没进榜      → 数据库里不该有任何痕迹（初审就不通过）
+       · 没刷新纪录  → 榜上已经有我更好的那条，不该重写
+     分开之后，"我这条被顶到 101 名"也不会把后来真正该上的成绩误判掉。 */
+  function qualifiesStandalone(board, id, score, at) {
+    var s = Number(score);
+    if (!isFinite(s) || s <= 0) return false;
+
+    var removedMine = false;
+    var rest = [];
+    for (var i = 0; i < board.entries.length; i++) {
+      if (board.entries[i].id === id) removedMine = true;   // 我原来那条被摘掉，等于腾出一个位子
+      else rest.push(board.entries[i]);
+    }
+    /* 摘掉自己之后还有空位 → 进；否则要和剩下那条榜尾比 */
+    if (rest.length < board.topN || removedMine) {
+      if (rest.length < board.topN) return true;
+      var tailMine = rest[rest.length - 1];
+      var hasAt0 = at !== undefined && at !== null && isFinite(Number(at));
+      return cmpEntry(
+        { score: s, submittedAt: hasAt0 ? Number(at) : Infinity, id: '' },
+        tailMine
+      ) < 0;
+    }
+    var last = rest[rest.length - 1];
+    var hasAt = at !== undefined && at !== null && isFinite(Number(at));
+    return cmpEntry(
+      { score: s, submittedAt: hasAt ? Number(at) : Infinity, id: '' },
+      last
+    ) < 0;
+  }
+
   /* 写入一条成绩：同一个人只留最好的一次；榜满则顶掉最低那位。
      返回 { board, entry, rank, made, replaced } —— replaced 是被顶掉的那位（没有则 null）。 */
   function applyEntry(board, entry) {
@@ -162,9 +196,14 @@
 
     if (prev && prev.score >= e.score) {
       /* 自己以前那次更好（或者一样），不动榜 —— 但名次照报，
-         并把「没被替换」这件事告诉调用方，好让界面上给玩家一句解释。 */
+         并把「没被替换」这件事告诉调用方，好让界面上给玩家一句解释。
+         made 另外单独算：把"我"摘掉之后，这个分数本来就进不了榜吗？ */
       return {
-        board: b, entry: prev, rank: prevIdx + 1, made: false, replaced: null,
+        board: b, entry: prev, rank: prevIdx + 1, replaced: null,
+        /* made：这一局**没有**写进榜（榜上还是我原来那条）。
+           qualifiesStandalone：如果只按分数算，这一局够不够格上榜 —— 两件事分开。 */
+        made: false,
+        qualifiesStandalone: qualifiesStandalone(b, e.id, e.score, e.submittedAt),
         keptPrev: true, prevScore: prev.score
       };
     }
@@ -174,13 +213,16 @@
     b.entries.push(e);
     b.entries.sort(cmpEntry);
 
+    /* 名次要在截断之前算：截断会把垫底那条丢掉，
+       如果新来的正好是垫底，截断后数组里就没它了，名次会变成 undefined。 */
+    for (var k = 0; k < b.entries.length; k++) {
+      if (b.entries[k].id === e.id) { rank = k + 1; break; }
+    }
+
     if (b.entries.length > b.topN) {
       replaced = b.entries.pop();       // 垫底的那位被顶出去
     }
 
-    for (var k = 0; k < b.entries.length; k++) {
-      if (b.entries[k].id === e.id) { rank = k + 1; break; }
-    }
     var made = rank !== undefined && rank <= b.topN;
 
     return { board: b, entry: e, rank: made ? rank : b.topN + 1, made: made, replaced: replaced };
@@ -234,6 +276,7 @@
   return {
     TOP_N: TOP_N,
     NO_RECORD: NO_RECORD,
+    qualifiesStandalone: qualifiesStandalone,
     cleanName: cleanName,
     hashIdentity: hashIdentity,
     cmpEntry: cmpEntry,

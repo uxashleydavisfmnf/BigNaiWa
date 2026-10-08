@@ -379,14 +379,74 @@ console.log('前端集成自检\n');
   fakeNow += 20000;                       // 过了提交间隔
   const r2 = playAndSettle(28, 53);       // 再打一局，分数更低
   ok(r2.score > 0 && r2.score < highScore, '第二局有分但比重低', r2.score + ' < ' + highScore);
-  await until(() => /已同步|无记录|没有超过|失败/.test(els.syncState.textContent), 60);
+  /* 等真正的终态：延迟上传要等 10 秒的提交间隔走完 */
+  const bDone = await until(() => /没刷新纪录|已同步 ✓|无记录|失败/.test(els.syncState.textContent), 400);
+  ok(bDone, '走到了终态（不是卡在正在同步）', els.syncState.textContent);
   board = readBoard();
   eq(board.entries.length, 1, '榜上还是 1 条（没有多出第二条）');
   eq(board.entries[0].score, highScore, '保留的仍是最好的那个分数');
   const owner2 = JSON.parse(repo.files.get('data/owners/' + MY_ID + '.json').text);
   eq(owner2.score, highScore, '存档也没被低分覆盖');
-  ok(/没有超过我自己的/.test(els.submitMsg.textContent), '告诉玩家这局没超过自己以前的成绩', els.submitMsg.textContent);
-  eq(els.syncState.textContent, '已同步 ✓', '数据库确认无需改动');
+  ok(/没有超过我自己的/.test(els.submitMsg.textContent) || /没刷新纪录/.test(els.syncState.textContent),
+    '告诉玩家这局没超过自己以前的成绩', els.submitMsg.textContent + ' / ' + els.syncState.textContent);
+  ok(/不占用上传/.test(els.syncState.textContent), '明说没刷新纪录就不上传', els.syncState.textContent);
+
+  /* ---------- B2. 同步节流：不该传的绝不传 ---------- */
+  console.log('\n[B2] 只有「刷新纪录 + 能上榜」才上传');
+  {
+    /* 场景一：连着打两局都没刷新纪录 → 一次 PUT 都不能有 */
+    const before = writes().length;
+    fakeNow += 20000;
+    playAndSettle(12, 41);
+    await until(() => /不占用上传|已同步|无记录|失败/.test(els.syncState.textContent), 60);
+    const afterLower = writes().slice(before);
+    eq(afterLower.length, 0, '再打一局没超过纪录 → 零上传', 'PUT ' + afterLower.length + ' 次');
+
+    /* 场景二：这局确实刷新了纪录，但已经打得很高、再打也超不过 → 仍然零上传 */
+    store.session = {};
+    const myOwnerNow = JSON.parse(repo.files.get('data/owners/' + MY_ID + '.json').text);
+    const before2 = writes().length;
+    fakeNow += 20000;
+    /* 故意打一局分数很低的，确保是"没超过纪录"而不是"没进榜" */
+    playAndSettle(9, 37);
+    await until(() => /不占用上传|已同步|无记录|失败/.test(els.syncState.textContent), 60);
+    eq(writes().slice(before2).length, 0, '没超过自己纪录时不写库');
+    const myOwnerAfter = JSON.parse(repo.files.get('data/owners/' + MY_ID + '.json').text);
+    eq(myOwnerAfter.score, myOwnerNow.score, '数据库里我的成绩没被动过');
+
+    /* 场景三：真的刷了纪录 → 会写 owner + 总榜。
+       构造：服务器上我的成绩是 50 分（"以前很菜"），榜上只有两个人、榜没满，
+       所以我再打一局正常分数就一定会刷新纪录并上榜。
+       同时清掉本地缓存的 myBest（真实游戏里开新局就会清）。 */
+    store.session = {};
+    const lowOwner = {
+      v: 1, id: MY_ID, key: 'ip', name: '匿名玩家', score: 50, runId: 'old-low',
+      submittedAt: 1700000000000, run: null, verify: { verdict: 'pass' }
+    };
+    putFile('data/owners/' + MY_ID + '.json', JSON.stringify(lowOwner));
+    const b3 = Board.newBoard();
+    b3.entries.push({
+      id: MY_ID, owner: 'data/owners/' + MY_ID + '.json', name: '匿名玩家',
+      score: 50, submittedAt: 1700000000000, runId: 'old-low', run: null, flags: 0
+    });
+    b3.entries.push({
+      id: 'someoneelse', owner: 'data/owners/someoneelse.json', name: '别人',
+      score: 30, submittedAt: 1700000001000, runId: 'other', run: null, flags: 0
+    });
+    putFile('data/board.json', JSON.stringify(b3));
+    await LB.refresh();
+    LB.onRunStart();                     // 相当于"开新一局"：清掉本局的 myBest 缓存
+    const before3 = writes().length;
+    fakeNow += 20000;
+    playAndSettle(40, 97);
+    /* 新人第一次上榜要走「读存档 → 写存档 → 读总榜 → 写总榜」，
+       中间还可能撞上 10 秒提交间隔而被推迟，所以要等到真正的终态再数。 */
+    const b3done = await until(() => /已同步 ✓|无记录|失败|没刷新纪录/.test(els.syncState.textContent), 400);
+    ok(b3done, '刷新纪录这一局走到了终态', els.syncState.textContent);
+    const after3 = writes().slice(before3);
+    ok(after3.length >= 1, '刷新纪录时确实上传了', 'PUT ' + after3.length + ' 次');
+    ok(after3.every((w) => w.url.indexOf('/contents/data/') >= 0), '只写数据目录');
+  }
 
   /* ---------- C. 没进前 100：一个字节都不写 ---------- */
   console.log('\n[C] 没进前 100 → 不写 GitHub');
@@ -407,17 +467,21 @@ console.log('前端集成自检\n');
   fakeNow += 20000;
   const r3 = playAndSettle(25, 71);
   ok(r3.score > 0, '这一局确实打了分', r3.score + ' 分');
-  const reached = await until(() => /已同步|无记录|失败/.test(els.syncState.textContent), 400);
+  const reached = await until(() => /已同步|无记录|失败|没刷新纪录/.test(els.syncState.textContent), 400);
   ok(reached, '走到了终态而不是卡在「正在同步…」', els.syncState.textContent);
-  ok(/101|无记录/.test(els.syncState.textContent), '明确写了「101 · 无记录」', els.syncState.textContent);
+  ok(!/正在同步/.test(els.syncState.textContent), '没停在「正在同步…」', els.syncState.textContent);
   const writesAfter = repo.calls.slice(callsBeforeMiss).filter((c) => c.method === 'PUT');
   eq(writesAfter.length, 0, '没有发起任何写入', 'PUT 次数 = ' + writesAfter.length);
   const missBoard = readBoard();
   eq(missBoard.entries.length, 100, '总榜没被动过');
   ok(!missBoard.entries.some((e) => e.score < 100000), '没有把自己的低分塞进去');
-  /* 本机榜上要把自己单独列出来，写「无记录」 */
+  /* 本机榜不应该把这条低分写进榜单数据里；界面上会额外挂一行「我 · 无记录」，
+     那是提示，不是榜上的一条。 */
+  const localBoard = LB.state().board;
+  eq(localBoard.entries.length, 100, '本地榜单数据还是 100 条（没把自己塞进去）');
+  ok(!localBoard.entries.some((e) => e.score < 100000), '本地榜里没有我这条低分');
   const myRow = els.boardList.children.filter((c) => /（我）/.test(c.textContent))[0];
-  ok(!!myRow, '本机榜上单独列出了我自己');
+  ok(!!myRow, '界面上另外挂了一行「我」的提示');
   ok(myRow && /无记录/.test(myRow.textContent), '那一行写着「无记录」', myRow && myRow.textContent);
 
   /* ---------- D. 网络故障：不崩、不写、能重试 ---------- */

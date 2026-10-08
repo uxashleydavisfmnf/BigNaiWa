@@ -63,7 +63,9 @@ eq(r.rank, 2, '150 分排第 2');
 
 r = Board.applyEntry(board, entry('a', 50));
 board = r.board;
-eq(r.made, false, '比自己以前的差 → 不进榜');
+eq(r.made, false, '比自己以前的差 → 榜上不会写这条');
+eq(r.keptPrev, true, '明确告诉我们"保留的是以前那条"');
+eq(r.qualifiesStandalone, true, '不过按分数算它本来就够格（两件事分开）');
 eq(board.entries.length, 2, '也不会顶掉谁');
 eq(board.entries.filter((e) => e.id === 'a').length, 1, '榜上这个人还是只有一条');
 eq(board.entries[1].score, 150, '保留的仍然是最好那次的分数');

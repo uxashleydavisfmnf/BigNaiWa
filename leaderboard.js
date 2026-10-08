@@ -9,8 +9,10 @@
  *    2. 先校验一遍自己这一局：结构、快照是否完整（每 500 分一条）、
  *       分数有没有道理、投放的水果等级对不对得上种子 —— 不过就不上传。
  *    3. 名次 > 100 的：不写 GitHub，显示「101 · 无记录」。
- *    4. 进前 100 的：写 data/owners/<我的ID>.json（种子 + 动作序列 + 快照 + 分数），
+ *    4. 只有「刷新了自己的最好成绩」**并且**「能进前 100」时，才写
+ *       data/owners/<我的ID>.json（种子 + 动作序列 + 快照 + 分数），
  *       再把前 100 名写回 data/board.json；人满了就顶掉分数最低的那位。
+ *       两样缺一样都不传 —— 省上传次数，也省得数据库里堆没用的记录。
  *    5. 写完把「正在同步…」换成「已同步 ✓」。
  *
  *  举报别人（榜上每一行都有「举报」）：
@@ -73,6 +75,7 @@
   let submitting = false;
   let pendingRun = null;          // 结算后待提交的这一局
   let myEntry = null;             // 本机乐观插入的那一条（用于「我」的高亮）
+  let myBest = 0;                 // 服务器确认过的、我自己的最好成绩（只用来省一次读；每局开始时清空）
   let syncState = 'idle';         // idle | syncing | synced | local | failed
 
   /* ---------------------------------------------------------
@@ -336,6 +339,8 @@
       }
       /* 我这一局没进榜的话，数据库里不会留下痕迹；
          把本机这一条留着，玩家还能在榜上看到自己"101 · 无记录" */
+      const mineRow = board.entries.filter((e) => e.id === myId)[0];
+      if (mineRow && mineRow.score > myBest) myBest = mineRow.score;
       if (myEntry && !board.entries.some((e) => e.id === myEntry.id)) {
         const m = board.entries.filter((e) => e.score < myEntry.score).length;
         myEntry.rank = m + 1 > Board.TOP_N ? Board.TOP_N + 1 : m + 1;
@@ -355,6 +360,7 @@
 
   function onRunStart() {
     myEntry = null;
+    myBest = 0;                  // 新一局开始，旧缓存作废（防止拿旧成绩挡掉该传的新纪录）
     pendingRun = null;
     setSync('idle', '');
     showRetry(false);
@@ -406,23 +412,47 @@
         submittedAt: at,
         rank: applied.rank
       } : null;
-      /* 用 applied.made 而不是 rank <= 100：
-         被顶到 101 名、或者同分挤不掉别人的，都算"没进榜"，一个字节都不写 */
+      /* 省上传次数：能上榜才走到上传这一步。
+         用 applied.made 而不是 rank <= 100：被顶到 101 名、或者同分挤不掉别人的，
+         都算"没进榜"，数据库里连痕迹都不留。
+         "有没有刷新自己的纪录"不在这里判 —— 本地榜可能是旧的，交给上传前读服务器存档来定。 */
+      /* madeLocal：这一局真的能进榜（applied.made 就是"有没有被写进榜"）。
+         keptPrev：榜上已经有我更好的一条 —— 这是"没刷新纪录"，和"没进榜"是两回事。 */
+      /* madeLocal：这一局真的被写进榜了（applied.made）。
+         eligible：按分数算够不够格上榜（被我以前那条占着位子时 made 会是 false，
+                   但它其实够格 —— 这是没刷新纪录，不是没进榜）。
+         keptPrev：榜上已经有我更好的一条。 */
       const madeLocal = score > 0 && applied.made;
+      const eligible = madeLocal || !!applied.keptPrev || !!applied.qualifiesStandalone;
+      const notPersonalBest = !!applied.keptPrev;
 
-      if (applied.keptPrev) {
-        /* 榜上本来就有我更好的成绩：不用写库，也不用重试 */
+      /* ① 进不了前 100 → 什么都不写，数据库里连痕迹都不留 */
+      if (!eligible) {
+        setMsg('本局 ' + Board.formatScore(score) + ' 分，没进前 100', '');
+        setSync('local', Board.NO_RECORD);
+        render();
+        return;
+      }
+      /* ② 能进榜但没超过自己那条 → 也不写（榜上保留我更好的成绩） */
+      if (notPersonalBest) {
         setMsg('本局 ' + Board.formatScore(score) + ' 分，没有超过我自己的 ' +
-               Board.formatScore(applied.prevScore) + ' 分（榜上保留最好成绩）', '');
-        setSync('synced', '已同步 ✓');
+               Board.formatScore(applied.prevScore) + ' 分（没刷新纪录，不占用上传）', '');
+        setSync('local', '没刷新纪录，不占用上传');
         render();
         return;
       }
 
-      setMsg(madeLocal
-        ? ('本局 ' + Board.formatScore(score) + ' 分，暂列第 ' + applied.rank + ' 名')
-        : ('本局 ' + Board.formatScore(score) + ' 分，没进前 100'), madeLocal ? 'good' : '');
+      setMsg('本局 ' + Board.formatScore(score) + ' 分，暂列第 ' + applied.rank + ' 名', 'good');
       render();
+
+      /* 本机就知道超不过自己的最好成绩 → 连读都不用读，直接省掉 */
+      if (myBest && score <= myBest) {
+        setMsg('本局 ' + Board.formatScore(score) + ' 分，没有超过我自己的 ' +
+               Board.formatScore(myBest) + ' 分（不占用上传）', '');
+        setSync('local', '没刷新纪录，不占用上传');
+        render();
+        return;
+      }
       submit(madeLocal);
     });
   }
@@ -518,26 +548,41 @@
       };
 
       let ownerSha = null;
+      let skippedByServer = false;
       return readJson(ownerPath(myId))
         .then((prev) => {
-          if (prev && prev.data && Number(prev.data.score) >= owner.score) {
-            /* 自己以前那次更好：对局数据不覆盖（榜上已经有那条了），
-               但总榜仍然要确认一下我的那一条在不在 —— 提前结束会让总榜漏写。 */
-            return null;
+          const serverBest = prev && prev.data ? Number(prev.data.score) || 0 : 0;
+          if (serverBest > myBest) myBest = serverBest;      // 服务器上更好，记下来
+          if (serverBest >= owner.score) {
+            /* 服务器上我以前的成绩更好（或者一样）→ 没刷新纪录，一个字节都不写。
+               这里以服务器为准：本地榜可能是旧的，不能拿它当权威。 */
+            skippedByServer = true;
+            return;
           }
           ownerSha = prev && prev.sha;
-          return writeJson(ownerPath(myId), owner, ownerSha, '成绩：' + owner.name + ' ' + owner.score + ' 分');
+          return writeJson(ownerPath(myId), owner, ownerSha,
+                           '成绩：' + owner.name + ' ' + owner.score + ' 分')
+            .then(() => { myBest = Math.max(myBest, owner.score); });
         })
-        .then(() => pushBoardEntry(owner))
         .then(() => {
-          submitting = false;
-          lastSubmitAt = Date.now();
-          try { localStorage.setItem(LAST_SUBMIT_KEY, String(lastSubmitAt)); } catch (e) { /* 忽略 */ }
-          setSync('synced', '已同步 ✓');
-          /* 乐观名次已经显示了，这里不要把它覆盖掉 —— 只把"上传成功"说清楚 */
-          const rankTxt = myEntry && myEntry.rank <= Board.TOP_N ? ('暂列第 ' + myEntry.rank + ' 名') : '已上榜';
-          setMsg('已上榜 ✓　' + owner.name + ' · ' + Board.formatScore(owner.score) + ' 分（' + rankTxt + '）', 'good');
-          return refresh();
+          if (skippedByServer) {
+            submitting = false;
+            setMsg('本局 ' + Board.formatScore(owner.score) + ' 分，没有超过我自己的 ' +
+                   Board.formatScore(myBest) + ' 分（没刷新纪录，没上传）', '');
+            setSync('local', '没刷新纪录，不占用上传');
+            render();
+            return;
+          }
+          return pushBoardEntry(owner).then(() => {
+            submitting = false;
+            lastSubmitAt = Date.now();
+            try { localStorage.setItem(LAST_SUBMIT_KEY, String(lastSubmitAt)); } catch (e) { /* 忽略 */ }
+            setSync('synced', '已同步 ✓');
+            /* 乐观名次已经显示了，别覆盖掉 —— 只把"上传成功"说清楚 */
+            const rankTxt = myEntry && myEntry.rank <= Board.TOP_N ? ('暂列第 ' + myEntry.rank + ' 名') : '已上榜';
+            setMsg('已上榜 ✓　' + owner.name + ' · ' + Board.formatScore(owner.score) + ' 分（' + rankTxt + '）', 'good');
+            return refresh();
+          });
         });
     }).catch((err) => {
       finishFail('同步失败：' + (err && err.message ? err.message : err));
@@ -559,6 +604,17 @@
         run: null
       };
       const applied = Board.applyEntry(cur, entry);
+
+      /* 榜上已经有我这条、而且分数没变 —— 那就是没有任何变化，别浪费一次上传 */
+      const prevMine = cur.entries.filter((e) => e.id === owner.id)[0];
+      if (prevMine && prevMine.score >= owner.score) {
+        board = cur;
+        boardLoaded = true;
+        myEntry = Object.assign({}, myEntry, { rank: applied.rank });
+        render();
+        return null;
+      }
+
       const next = applied.board;
       next.updatedAt = Date.now();
       next.total = Math.max(Number(cur.total) || 0, next.entries.length);
