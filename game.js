@@ -884,8 +884,8 @@
     MAX_BONUS, REVIVE_STEP: Core.REVIVE_STEP,
     gameOver: engine.gameOver,
     showOver, flushOver,
-    /* 复算 / 防作弊相关的句柄 */
-    Core, engine,
+    /* 榜单相关的句柄 */
+    engine,
     exportRun: engine.exportRun,
     runId: () => runId,
     seed: () => engine.getSeed(),

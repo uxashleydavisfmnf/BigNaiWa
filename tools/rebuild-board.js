@@ -5,8 +5,8 @@
  *      node tools/rebuild-board.js
  *
  *  干三件事：
- *    1. 复核 data/reports/ 下的举报：用同一份规则把被举报的那一局重算一遍
- *       （不采信举报里的结论），确认造假就删掉那个人的成绩和对局数据；
+ *    1. 复核 data/reports/ 下的举报：用同一份规则把被举报那局的快照重新校验一遍
+ *       （不采信举报里的结论），确认不合格就删掉那个人的成绩和对局数据；
  *    2. 从 data/owners/ 重新拼出 data/board.json（前 100 名，每人只留最好成绩）；
  *    3. 把处理完的举报文件删掉、把复核结果写进 data/voided.json。
  *
@@ -103,20 +103,21 @@ function moderate() {
       continue;
     }
 
-    /* 独立复核：不采信举报里的结论 */
+    /* 独立复核：不采信举报里的结论，自己按快照重新校验一遍 */
     let verdict;
     try {
       const rec = Core.decodeRun(owner.run);
       rec.score = Number(owner.score) || 0;
-      verdict = Core.validateRun(rec);
+      verdict = Core.auditRun(rec);
     } catch (e) {
-      verdict = { verdict: 'malformed', ok: false, reason: '复算异常：' + e.message };
+      verdict = { verdict: 'malformed', ok: false, reason: '校验异常：' + e.message };
     }
 
     const claimed = Number(owner.score) || 0;
-    console.log('  · 举报 ' + targetId + '（榜上 ' + claimed + ' 分）→ 复核 ' +
-                verdict.verdict + '，复算 ' + (verdict.replayScore === undefined ? '—' : verdict.replayScore) +
-                ' 分' + (verdict.reason ? '：' + verdict.reason : ''));
+    console.log('  · 举报 ' + targetId + '（榜上 ' + claimed + ' 分）→ 快照校验 ' +
+                verdict.verdict +
+                (verdict.stats ? '，' + verdict.stats.snapshots + ' 条快照 / ' + verdict.stats.drops + ' 次投放' : '') +
+                (verdict.reason ? '：' + verdict.reason : ''));
 
     if (verdict.ok) {
       console.log('    复核通过 → 成绩没问题，驳回举报');
@@ -135,8 +136,8 @@ function moderate() {
         at: Date.now(),
         reason: verdict.reason || verdict.verdict,
         verdict: verdict.verdict,
-        replay: verdict.replayScore === undefined ? null : verdict.replayScore,
-        delta: verdict.delta === undefined ? null : verdict.delta,
+        problems: (verdict.problems || []).slice(0, 6),
+        snapshots: (verdict.stats && verdict.stats.snapshots) || 0,
         reports: 1,
         verifier: 'github-actions/rebuild-board'
       };
@@ -182,18 +183,18 @@ function rebuild() {
     const score = Number(owner.score);
     if (!isFinite(score) || score <= 0) { skipped++; continue; }
 
-    /* 有对局数据就顺手复核一遍：数据被改过就不让它进榜 */
+    /* 有对局数据就顺手校验一遍快照：数据明显不完整/不合理的就不让它进榜 */
     if (owner.run) {
       let v;
       try {
         const rec = Core.decodeRun(owner.run);
         rec.score = score;
-        v = Core.validateRun(rec);
+        v = Core.auditRun(rec);
       } catch (e) {
-        v = { ok: false, verdict: 'malformed', reason: '复算异常：' + e.message };
+        v = { ok: false, verdict: 'malformed', reason: '校验异常：' + e.message };
       }
       if (!v.ok) {
-        console.log('  ! ' + id + ' 的对局数据复核不通过（' + v.verdict + '），不进榜：' + (v.reason || ''));
+        console.log('  ! ' + id + ' 的快照没通过（' + v.verdict + '），不进榜：' + (v.reason || ''));
         skipped++;
         continue;
       }

@@ -366,7 +366,10 @@ console.log('前端集成自检\n');
   ok(!!owner.run && !!owner.run.seed, '存档里有随机种子');
   ok(typeof owner.run.a === 'string' && owner.run.a.indexOf(',') > 0, '存档里有动作序列（帧号,投放位置）', owner.run.a.slice(0, 40));
   ok(typeof owner.run.k === 'string' && owner.run.k.indexOf('f0,s0') === 0, '存档里有过程快照', owner.run.k.slice(0, 40));
-  eq(owner.verify.verdict, 'pass', '上传前自证复算通过');
+  eq(owner.verify.verdict, 'pass', '上传前快照自检通过');
+  ok((owner.verify.snapshots || 0) >= 2, '存档里记了快照条数', owner.verify.snapshots + ' 条');
+  ok(/每 500 分一条/.test(JSON.stringify(owner.run.k).slice(0, 400)) === false && owner.run.k.indexOf('s0,') >= 0,
+    '快照里有 0 分那条');
   const badWrites = writes().filter((w) => w.url.indexOf('/contents/data/') < 0);
   eq(badWrites.length, 0, '只写了仓库里的数据文件');
 
@@ -470,8 +473,14 @@ console.log('前端集成自检\n');
   const reportBtn = rows[0].children.filter((c) => c.className.indexOf('report-btn') >= 0)[0];
   reportBtn._h.click({ target: reportBtn, preventDefault() {} });
   await until(() => /无记录|已举报|已核对/.test(reportBtn.textContent), 40);
-  eq(reportBtn.textContent, '无记录', '按钮直接写「无记录」');
-  eq(writes().filter((w) => w.url.indexOf('data/reports') >= 0).length, 0, '没有写任何举报记录');
+  eq(reportBtn.textContent, '已举报 ✓', '点了举报 → 按「快照缺失」提交');
+  const ghostReports = writes().filter((w) => w.url.indexOf('data/reports') >= 0);
+  eq(ghostReports.length, 1, '写了一份「快照缺失」的举报记录');
+  const ghostPath = decodeURIComponent(ghostReports[0].url.split('/contents/')[1].split('?')[0]);
+  const ghostEvidence = JSON.parse(repo.files.get(ghostPath).text);
+  eq(ghostEvidence.targetId, 'ghostxx', '举报指向那条没有记录的分数');
+  eq(ghostEvidence.verdict, 'incomplete', '裁决是「数据不完整」');
+  ok(/没有对局记录|快照/.test(ghostEvidence.reason), '说清楚是快照缺失', ghostEvidence.reason);
 
   /* ---------- F. 举报：真作弊才写证据 ---------- */
   console.log('\n[F] 举报真作弊 / 不误报老实人');
@@ -506,18 +515,19 @@ console.log('前端集成自检\n');
   const evidence = JSON.parse(repo.files.get(reportPath).text);
   eq(evidence.targetId, 'cheatzon', '举报指向正确的人');
   eq(evidence.claimed, 999999, '记录了榜上写的分数');
-  ok(evidence.replay < 999999 && evidence.replay > 0, '记录了本地复算出来的分数', '复算 ' + evidence.replay);
-  ok(evidence.verdict === 'fraud' || evidence.verdict === 'tamper', '给了裁决', evidence.verdict);
+  ok(evidence.verdict && evidence.verdict !== 'pass', '给了不给过的裁决', evidence.verdict);
+  ok(typeof evidence.reason === 'string' && evidence.reason.length > 0, '给了具体理由', evidence.reason);
+  ok(Array.isArray(evidence.problems), '带了问题清单', JSON.stringify(evidence.problems || []).slice(0, 70));
 
   /* 老实人：复算对得上 → 只提示「已核对」，不写举报 */
   const honestBtn = rowList[1].children.filter((c) => c.className.indexOf('report-btn') >= 0)[0];
   const beforeHonest = writes().filter((w) => w.url.indexOf('data/reports') >= 0).length;
   honestBtn._h.click({ target: honestBtn, preventDefault() {} });
-  const honestDone = await until(() => /已核对|已举报|无记录|失败/.test(honestBtn.textContent), 200);
-  ok(honestDone, '复算跑完了', honestBtn.textContent);
-  eq(honestBtn.textContent, '已核对', '老实人只显示「已核对」');
+  const honestDone = await until(() => /快照完整|已举报|无记录|失败/.test(honestBtn.textContent), 200);
+  ok(honestDone, '核查跑完了', honestBtn.textContent);
+  eq(honestBtn.textContent, '快照完整', '老实人只显示「快照完整」');
   eq(writes().filter((w) => w.url.indexOf('data/reports') >= 0).length, beforeHonest, '没有误报');
-  ok(/一致/.test(honestBtn.title), '提示说明了复算一致', honestBtn.title);
+  ok(/快照完整|没有发现问题/.test(honestBtn.title), '提示说明了快照完整', honestBtn.title);
 
   /* ---------- G. 拿不到公网 IP → 本地 ID 兜底 ---------- */
   console.log('\n[G] 拿不到公网 IP');

@@ -6,16 +6,16 @@
  *  一次上榜（结算后）：
  *    1. 结算完立刻在本机把「我这一局」插进排行榜，玩家马上看到正确名次；
  *       同时下面写「正在同步…」。
- *    2. 先复算一遍自己这一局（种子 + 动作序列）—— 复算不过就根本不上传，
- *       省得白跑一趟。（顺手也算自证清白）
+ *    2. 先校验一遍自己这一局：结构、快照是否完整（每 500 分一条）、
+ *       分数有没有道理、投放的水果等级对不对得上种子 —— 不过就不上传。
  *    3. 名次 > 100 的：不写 GitHub，显示「101 · 无记录」。
  *    4. 进前 100 的：写 data/owners/<我的ID>.json（种子 + 动作序列 + 快照 + 分数），
  *       再把前 100 名写回 data/board.json；人满了就顶掉分数最低的那位。
  *    5. 写完把「正在同步…」换成「已同步 ✓」。
  *
  *  举报别人（榜上每一行都有「举报」）：
- *    · 把那个人的存档拉下来，在本地用保存的随机种子和动作序列完整复算一遍；
- *    · 分数差太多 → 写一份举报记录，并把证据（复算分数、差值）一起存进库里；
+ *    · 把那个人的存档拉下来，检查他的快照是不是完整、分数有没有道理；
+ *    · 快照缺失 / 分数对不上 → 写一份举报记录，并把问题清单一起存进库里；
  *    · 只提交证据，不直接改别人的成绩 —— 抹除由自动化流程按证据执行，
  *      免得谁都能一键删榜。
  * ============================================================ */
@@ -294,7 +294,7 @@
       btn.type = 'button';
       btn.className = 'report-btn';
       btn.textContent = '举报';
-      btn.title = '在本地用这位玩家的随机种子和动作序列复算一遍，对不上就提交证据';
+      btn.title = '检查这位玩家的快照是否完整（每 500 分一条）、分数有没有道理，有问题就提交证据';
       btn.addEventListener('click', () => reportEntry(entry, btn));
       line.appendChild(btn);
     }
@@ -462,18 +462,24 @@
       return;
     }
 
-    /* 1) 先自证：复算不过就根本不上传 */
+    /* 1) 先自检：快照不完整 / 分数没道理，就根本不上传 */
     let selfCheck;
     try {
-      selfCheck = Core.validateRun(pendingRun.run);
+      selfCheck = Core.auditRun({
+        seed: pendingRun.run.seed,
+        score: pendingRun.score,
+        actions: pendingRun.run.actions,
+        snapshots: pendingRun.run.snapshots,
+        spawn: pendingRun.run.spawn
+      });
     } catch (e) {
       selfCheck = { verdict: 'malformed', ok: false, reason: '本局数据异常' };
     }
 
     if (!selfCheck.ok) {
       submitting = false;
-      setMsg('本局未能通过复算校验，成绩留在本机：' + (selfCheck.reason || selfCheck.verdict), 'bad');
-      setSync('local', '未上传（复算未通过）');
+      setMsg('本局快照没通过自检，成绩留在本机：' + (selfCheck.reason || selfCheck.verdict), 'bad');
+      setSync('local', '未上传（快照不完整）');
       render();
       return;
     }
@@ -504,7 +510,11 @@
         runId: pendingRun.runId,
         submittedAt: pendingRun.at,
         run: Core.encodeRun(pendingRun.run),
-        verify: { verdict: selfCheck.verdict, replay: selfCheck.replayScore }
+        verify: {
+          verdict: selfCheck.verdict,
+          snapshots: (pendingRun.run.snapshots || []).length,
+          drops: (pendingRun.run.actions || []).filter((a) => a.k === 'drop').length
+        }
       };
 
       let ownerSha = null;
@@ -569,22 +579,14 @@
   }
 
   /* ---------------------------------------------------------
-   *  举报：本地复算别人的存档
-   * ------------------------------------------------------- */
+   *  举报：检查别人的快照是否完整
+   *  ------------------------------------------------------- */
 
   function reportEntry(entry, btn) {
     if (!entry || !entry.id) return;
     const old = btn.textContent;
     btn.disabled = true;
-
-    /* 复算是分段跑的（每 12ms 交还一次主线程），所以这里能实时刷进度 */
-    let lastPct = -1;
-    const paint = (pct) => {
-      if (pct === lastPct) return;
-      lastPct = pct;
-      btn.textContent = pct > 0 ? ('复算中 ' + pct + '%') : '复算中…';
-    };
-    paint(0);
+    btn.textContent = '核查中…';
 
     const stop = (text) => {
       btn.disabled = false;
@@ -593,63 +595,69 @@
 
     readJson(ownerPath(entry.id)).then((res) => {
       if (!res || !res.data || !res.data.run) {
-        stop('无记录');
-        btn.title = '这条成绩在数据库里没有对应的对局记录（种子 / 动作序列已缺失），无法复算';
-        return;
+        /* 数据库里没有这局的快照 —— 这本身就是「快照不完善」，点举报就提交 */
+        stop('已举报 ✓');
+        btn.title = '已提交举报：数据库里没有这局的快照与动作序列（无记录）';
+        return writeReport(entry, Number(entry.score) || 0, {
+          verdict: 'incomplete',
+          reason: '数据库里没有这局的快照与动作序列（无记录）',
+          problems: ['no record'],
+          stats: { snapshots: 0 }
+        }).then((done) => {
+          if (done) {
+            const row = btn.parentNode;
+            if (row && row.classList) row.classList.add('is-reported');
+          }
+          return done;
+        });
       }
+
       const rec = Core.decodeRun(res.data.run);
       const claimed = Number(res.data.score) || Number(entry.score) || 0;
       rec.score = claimed;
 
-      let total = 0;
-      const acts = rec.actions || [];
-      const snaps = rec.snapshots || [];
-      if (acts.length) total = Math.max(total, acts[acts.length - 1].t);
-      if (snaps.length) total = Math.max(total, snaps[snaps.length - 1].f);
+      const audit = Core.auditRun(rec);
 
-      return Core.verifyRunAsync(rec, {
-        timeSlice: 12,
-        onProgress: (frameNow) => {
-          if (total > 0) paint(Math.min(99, Math.round(frameNow / total * 100)));
-        }
-      }).then((verdict) => {
-        if (verdict.verdict === 'pass') {
-          stop('已核对');
-          btn.title = '本地复算结果与榜上分数一致（' + verdict.replayScore + ' 分），没有发现问题';
-          return false;
-        }
+      if (audit.ok) {
+        stop('快照完整');
+        btn.title = '快照完整：' + (rec.snapshots || []).length + ' 条快照（每 500 分一条）、分数对得上，没有发现问题';
+        return false;
+      }
 
-        /* 对不上：把举报连同证据写进库里（不直接改别人的成绩，
-           抹除交给自动化复核按证据执行，免得谁都能一键删榜） */
-        const evidence = {
-          v: 1,
-          at: Date.now(),
-          targetId: entry.id,
-          targetName: entry.name,
-          claimed: claimed,
-          replay: verdict.replayScore,
-          delta: verdict.delta,
-          verdict: verdict.verdict,
-          reason: verdict.reason || '',
-          frameErrors: verdict.frameErrorCount || 0,
-          by: myId || ('local-' + localId()),
-          runId: entry.runId || ''
-        };
-        const name = String(entry.id).slice(0, 6) + '-' + Date.now().toString(36);
-        return writeJson(reportPath(name), evidence, null,
-          '举报：' + entry.name + ' ' + claimed + ' 分（复算 ' + verdict.replayScore + '）'
-        ).then(() => {
-          stop('已举报 ✓');
-          btn.title = '已提交举报：本地复算 ' + verdict.replayScore + ' 分，榜上写的 ' + claimed + ' 分';
+      stop('已举报 ✓');
+      btn.title = '已提交举报：' + (audit.reason || audit.verdict);
+      return writeReport(entry, claimed, audit).then((done) => {
+        if (done) {
           const row = btn.parentNode;
           if (row && row.classList) row.classList.add('is-reported');
-          return true;
-        });
+        }
+        return done;
       });
     }).catch((err) => {
       stop('举报失败');
       btn.title = '举报失败：' + (err && err.message ? err.message : err);
     });
+  }
+
+  /* 把举报证据写进库里（不直接改别人的成绩，抹除交给自动化复核） */
+  function writeReport(entry, claimed, audit) {
+    const evidence = {
+      v: 1,
+      at: Date.now(),
+      targetId: entry.id,
+      targetName: entry.name,
+      claimed: claimed,
+      verdict: audit.verdict,
+      reason: audit.reason || '',
+      problems: (audit.problems || []).slice(0, 8),
+      snapshots: (audit.stats && audit.stats.snapshots) || 0,
+      by: myId || ('local-' + localId()),
+      runId: entry.runId || ''
+    };
+    const name = String(entry.id).slice(0, 6) + '-' + Date.now().toString(36);
+    return writeJson(reportPath(name), evidence, null,
+      '举报：' + entry.name + ' ' + claimed + ' 分（' + audit.verdict + '）'
+    ).then(() => true);
   }
 
   /* ---------------------------------------------------------

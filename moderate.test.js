@@ -85,7 +85,7 @@ const cheatRun = realRun(777001, 40, (i) => 70 + ((i * 61) % 280));
 const writeOwner = (id, name, score, run, at) => {
   fs.writeFileSync(path.join(tmp, 'data', 'owners', id + '.json'), JSON.stringify({
     v: 1, id: id, key: 'ip', name: name, score: score, runId: 'run-' + id,
-    submittedAt: at, run: Core.encodeRun(run), verify: { verdict: 'pass', replay: score }
+    submittedAt: at, run: Core.encodeRun(run), verify: { verdict: 'pass', snapshots: (run.snapshots || []).length }
   }, null, 2));
 };
 
@@ -100,7 +100,7 @@ fs.writeFileSync(path.join(tmp, 'data', 'owners', 'ghost00000001.json'), JSON.st
 const writeReport = (target, extra) => {
   const body = Object.assign({
     v: 1, at: 1700000004000, targetId: target, targetName: '作弊者',
-    claimed: 99999, replay: 0, delta: -99999, verdict: 'fraud',
+    claimed: 99999, verdict: 'implausible',
     reason: '（这份结论是举报者写的，复核不该采信）', frameErrors: 0, by: 'reporter', runId: 'run-x'
   }, extra || {});
   fs.writeFileSync(path.join(tmp, 'data', 'reports', target.slice(0, 6) + '-x.json'), JSON.stringify(body, null, 2));
@@ -125,11 +125,10 @@ const voided = JSON.parse(fs.readFileSync(path.join(tmp, 'data', 'voided.json'),
 eq(voided.records.length, 1, '黑名单里有一条');
 eq(voided.records[0].id, 'cheat00000001', '记的是作弊者');
 eq(voided.records[0].score, 99999, '记下「当时报了多少分」');
-ok(typeof voided.records[0].replay === 'number' && voided.records[0].replay < 99999,
-  '记下「复算出来多少分」', '复算 ' + voided.records[0].replay);
-ok(JSON.stringify(voided.records[0]).indexOf('snapshots') < 0 &&
-   JSON.stringify(voided.records[0]).indexOf('"a"') < 0,
-  '黑名单不含对局数据');
+ok(Array.isArray(voided.records[0].problems) || typeof voided.records[0].reason === 'string',
+  '记下具体问题', JSON.stringify(voided.records[0].problems || voided.records[0].reason).slice(0, 90));
+ok(JSON.stringify(voided.records[0]).indexOf('"a"') < 0,
+  '黑名单不含对局数据（动作序列）');
 
 console.log('\n[2] 重建总榜');
 const board = JSON.parse(fs.readFileSync(path.join(tmp, 'data', 'board.json'), 'utf8'));
@@ -162,7 +161,7 @@ fs.writeFileSync(path.join(tmp, 'data', 'owners', 'tamper0000001.json'), JSON.st
   submittedAt: 1700000005000, run: Core.encodeRun(honestRun)   // 数据是真的，分数是假的
 }, null, 2));
 out = runTool(tmp);
-ok(out.indexOf('tamper0000001') >= 0 && out.indexOf('复核不通过') >= 0, '被拒收', '');
+ok(out.indexOf('tamper0000001') >= 0 && /没通过|复核不通过/.test(out), '被拒收', '');
 const board2 = JSON.parse(fs.readFileSync(path.join(tmp, 'data', 'board.json'), 'utf8'));
 ok(!board2.entries.some((e) => e.id === 'tamper0000001'), '改了分数的记录进不了总榜');
 ok(board2.entries.some((e) => e.id === 'honest0000001'), '没影响别人');

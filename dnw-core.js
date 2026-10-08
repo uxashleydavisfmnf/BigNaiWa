@@ -20,7 +20,7 @@
  *    engine.drop(x) / engine.revive() → 玩家动作（会被记进动作序列）
  *    engine.takeSnapshot()            → 手动封存一个快照
  *    engine.exportRun()               → { seed, actions, snapshots, score, ... }
- *    verifyRun(rec)                   → 复算一遍，给出裁决
+ *    auditRun(rec)                    → 只校验快照与掉落流水（1000 分只要几毫秒）
  * ============================================================ */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
@@ -84,11 +84,13 @@
   var AVOID_REPEAT = true;
 
   var FIXED = 1 / 60;            // 逻辑步长；快照按帧号对齐
-  var SNAPSHOT_EVERY = 120;      // 每 2 秒封一个快照（一局约 60~120 个）
+  var SNAP_STEP = 500;           // 每 500 分封一条快照
+  var SIG_KEY = 0x9E3779B1;      // 快照签名的混淆常量（只防手改，不是加密）
+  var MAX_FRAMES = 60 * 60 * 60; // 一局最多这么多帧（1 小时 60fps），超过就不是人玩的
 
   /* ---------------------------------------------------------
    *  种子化随机数：mulberry32
-   *  只要种子一样，吐出来的序列一定一样 —— 复算的前提。
+   *  只要种子一样，吐出来的序列一定一样 —— 校验的前提。
    * ------------------------------------------------------- */
 
   function mulberry32(a) {
@@ -124,28 +126,19 @@
   /* ---------------------------------------------------------
    *  快照哈希：32 位滚动哈希
    *  Math.imul 在 ECMAScript 里是精确的 32 位整数乘法，
-   *  所有引擎结果一致 —— 所以它可以当复算的指纹用。
+   *  所有引擎结果一致 —— 所以它可以当校验的指纹用。
    * ------------------------------------------------------- */
 
-  function hashInit() { return 2166136261 >>> 0; }
-  function hashMix(h, v) {
-    h = (h ^ (v >>> 0)) >>> 0;
-    h = Math.imul(h, 16777619) >>> 0;
-    return (h >>> 0);
-  }
-  function q3(v) { return Math.round(v * 1000); }   // 量化到 0.001，吸收末位浮点差
-
-  function hashBalls(balls) {
-    var h = hashInit();
-    for (var i = 0; i < balls.length; i++) {
-      var b = balls[i];
-      h = hashMix(h, b.tier);
-      h = hashMix(h, q3(b.x));
-      h = hashMix(h, q3(b.y));
-      h = hashMix(h, q3(b.vx));
-      h = hashMix(h, q3(b.vy));
+  /* 快照签名：把一条快照的关键字段揉成一个短标记。
+     它挡的是「手改 JSON 里的分数 / 时间戳」这种最低级的做法 ——
+     密钥在客户端，所以这不是加密，只是让手改成本变高。 */
+  function snapSig(seed, sn) {
+    var h = (seed >>> 0) ^ SIG_KEY;
+    var str = sn.f + '|' + sn.s + '|' + sn.n + '|' + sn.r + '|' + sn.t + '|' + (sn.d || 0);
+    for (var i = 0; i < str.length; i++) {
+      h = Math.imul(h ^ str.charCodeAt(i), 16777619) >>> 0;
     }
-    return h >>> 0;
+    return (h >>> 0).toString(36);
   }
 
   /* ---------------------------------------------------------
@@ -211,7 +204,12 @@
    * ------------------------------------------------------- */
 
   function createGame(seed) {
-    var rng = mulberry32(seed >>> 0);
+    /* 掉落等级用一条流、粒子特效用另一条。
+       分开之后「第 i 次投放掉哪一级」就只由种子决定，
+       和玩家合了多少次、喷了多少粒子完全无关 —— 掉落流水才能拿来当校验依据。 */
+    var spawnRng = mulberry32(seed >>> 0);
+    var fxRng = mulberry32((seed ^ 0x5bf03635) >>> 0);
+    var rng = fxRng;               // 表现用的随机（粒子等）继续叫 rng
 
     var state = {
       balls: [],
@@ -235,8 +233,10 @@
     var frame = 0;                 // 本局已经推进的逻辑帧数
     var actions = [];              // 玩家动作序列
     var snapshots = [];            // 周期性快照
-    var nextSnapAt = 0;            // 下一个快照的帧号
+    var nextSnapScore = SNAP_STEP; // 下一个要封快照的分数档（每 500 分一条）
     var overFrame = -1;
+    var dropCount = 0;             // 本局已投放次数（快照里要带上）
+    var spawnSeen = '';            // 掉落等级流水：第 i 次投放掉的是第几级
     var ended = false;
 
     /* 计分/飘字/音效的钩子。内核不认识 DOM，全部交给外面 */
@@ -248,11 +248,14 @@
       onGameOver: null    // () => void
     };
 
-    /* ---------- 随机：所有玩法随机都走这里 ---------- */
+    /* ---------- 随机 ----------
+       · rollSpawnTier / pickSpawnTier 只吃 spawnRng（决定掉落等级）
+       · 其它表现类的随机（粒子）只吃 fxRng
+       这样掉落序列和"合成了几次"彻底解耦。 */
     var rand = function (a, b) { return a + rng() * (b - a); };
 
     function rollSpawnTier() {
-      var r = rng(), acc = 0;
+      var r = spawnRng(), acc = 0;
       for (var i = 0; i < SPAWN_TIERS.length; i++) {
         acc += SPAWN_WEIGHTS[i];
         if (r <= acc) return SPAWN_TIERS[i];
@@ -593,6 +596,8 @@
 
       /* 记进动作序列：第几帧、投在哪、投的是哪一级（审计用） */
       actions.push({ k: 'drop', t: frame, x: Math.round(px * 1000) / 1000, tier: tier });
+      dropCount++;
+      spawnSeen += tier.toString(36);
       if (state.balls.length > 90) state.balls = state.balls.filter(function (b) { return !b.dead; });
       return true;
     }
@@ -657,24 +662,54 @@
       state.over = true;
       overFrame = frame;
       /* 收尾快照：最后这一下也要能对上 */
-      sealSnapshot(frame, true);
+      sealSnapshot(true);        // 收尾那条：分数就是最终分数
       if (hooks.onGameOver) hooks.onGameOver();
     }
 
     /* ---------- 快照 ---------- */
 
-    function sealSnapshot(atFrame, force) {
-      var last = snapshots.length ? snapshots[snapshots.length - 1] : null;
-      if (!force && last && last.f === atFrame) return;
+    /* 封一条快照。
+       现在是「每 500 分一条」：只要分数跨过了下一个 500 的整倍数就封，
+       开局 0 分先封一条，结束（判负）时再封一条收尾。
+       每条都带上：帧号、分数、球数、复活币、时间戳、签名。 */
+    /* 封快照。
+       规则：每跨过 500 分封一条，那条**记的就是跨过的那个整倍数**
+       （500 / 1000 / 1500……），开局先封一条 0 分；
+       收尾（判负）再封一条，分数就是这一局最终拿到的分数。
+       每条带上：帧号、分数、球数、复活币、已投放次数、时间戳、签名。 */
+    function sealSnapshot(force) {
+      var isStart = snapshots.length === 0;
+      var isEnd = !!force;
 
-      snapshots.push({
-        f: atFrame,
-        s: state.score,
+      if (isStart) { pushSnap(0); return; }
+
+      if (isEnd) {
+        /* 收尾：最终分数可能刚好等于上一条（比如正好卡在 500），那就别重复 */
+        if (snapshots[snapshots.length - 1].s !== state.score) pushSnap(state.score);
+        return;
+      }
+
+      if (state.score < SNAP_STEP) return;
+      var bucket = Math.floor(state.score / SNAP_STEP) * SNAP_STEP;
+      if (bucket < nextSnapScore) return;          // 还没跨到下一个整倍数
+      if (snapshots[snapshots.length - 1].s === bucket) return;  // 这条已经有了
+      pushSnap(bucket);
+    }
+
+    function pushSnap(score) {
+      var sn = {
+        f: frame,
+        s: score,
         n: state.balls.length,
         r: state.revives,
-        h: hashBalls(state.balls)
-      });
-      state.lastSnapshot = snapshots[snapshots.length - 1];
+        d: dropCount,
+        t: Date.now(),
+        g: ''
+      };
+      sn.g = snapSig(seed, sn);
+      snapshots.push(sn);
+      state.lastSnapshot = sn;
+      nextSnapScore = (Math.floor(score / SNAP_STEP) + 1) * SNAP_STEP;
     }
 
     /* ---------- 主更新 ---------- */
@@ -682,7 +717,7 @@
     function update(dt) {
       if (dt === undefined) dt = FIXED;
 
-      /* 清场定格：世界停一下，但帧号照样走（复算时同样对待） */
+      /* 清场定格：世界停一下，但帧号照样走（校验时同样对待） */
       if (state.freeze > 0) {
         state.freeze = Math.max(0, state.freeze - dt);
         frame++;
@@ -707,10 +742,7 @@
       if (state.flash > 0) state.flash = Math.max(0, state.flash - dt * 2.2);
 
       frame++;
-      if (frame >= nextSnapAt) {
-        nextSnapAt = frame + SNAPSHOT_EVERY;
-        sealSnapshot(frame, false);
-      }
+      sealSnapshot(false);          // 跨过 500 分整倍数就封一条
     }
 
     /* ---------- 复位 ---------- */
@@ -718,7 +750,9 @@
     function reset(newSeed) {
       if (newSeed !== undefined && newSeed !== null) {
         seed = newSeed >>> 0;
-        rng = mulberry32(seed);
+        spawnRng = mulberry32(seed);
+        fxRng = mulberry32((seed ^ 0x5bf03635) >>> 0);
+        rng = fxRng;
       }
       state.balls.length = 0;
       state.particles.length = 0;
@@ -740,14 +774,22 @@
       frame = 0;
       actions = [];
       snapshots = [];
-      nextSnapAt = SNAPSHOT_EVERY;
+      nextSnapScore = SNAP_STEP;
+      dropCount = 0;
+      spawnSeen = '';
       overFrame = -1;
       ended = false;
-      sealSnapshot(0, true);       // 开局快照：分数必然是 0，堵住「一上来就有一坨分」
+      sealSnapshot(true);          // 开局那条 0 分快照
       return seed;
     }
 
     function exportRun() {
+      /* 导出时补一条收尾快照：有些局不是"判负"结束的（玩家自己收了、
+         或者没到判负就先结算了），不补的话最后一条快照不等于最终分数，
+         校验会说数据不完整。 */
+      if (!snapshots.length || snapshots[snapshots.length - 1].s !== state.score) {
+        sealSnapshot(true);
+      }
       return {
         seed: seedToStr(seed),
         score: state.score,
@@ -756,7 +798,8 @@
         snapshots: snapshots.slice(),
         final: snapshots.length ? snapshots[snapshots.length - 1] : null,
         overFrame: overFrame,
-        revives: state.revives
+        revives: state.revives,
+        spawn: spawnSeen
       };
     }
 
@@ -768,7 +811,7 @@
       FRUITS: FRUITS,
       MAX_BONUS: MAX_BONUS,
       REVIVE_STEP: REVIVE_STEP,
-      CONST: { W: W, H: H, WALL: WALL, DROP_Y: DROP_Y, DANGER_Y: DANGER_Y, DROP_MS: DROP_MS, FIXED: FIXED, SNAPSHOT_EVERY: SNAPSHOT_EVERY },
+      CONST: { W: W, H: H, WALL: WALL, DROP_Y: DROP_Y, DANGER_Y: DANGER_Y, DROP_MS: DROP_MS, FIXED: FIXED, SNAP_STEP: SNAP_STEP },
 
       update: update,
       stepPhysics: stepPhysics,
@@ -782,10 +825,15 @@
 
       getFrame: function () { return frame; },
       getSeed: function () { return seed; },
-      setSeed: function (s) { seed = s >>> 0; rng = mulberry32(seed); },
+      setSeed: function (s) {
+        seed = s >>> 0;
+        spawnRng = mulberry32(seed);
+        fxRng = mulberry32((seed ^ 0x5bf03635) >>> 0);
+        rng = fxRng;
+      },
       getActions: function () { return actions.slice(); },
       getSnapshots: function () { return snapshots.slice(); },
-      sealSnapshot: function (force) { sealSnapshot(frame, force !== false); },
+      sealSnapshot: function (force) { sealSnapshot(force !== false); },
       encodeSnapshot: function () { return snapshots.length ? snapshotLine(snapshots[snapshots.length - 1]) : ''; },
       exportRun: exportRun,
       gameOver: gameOver,
@@ -794,30 +842,17 @@
   }
 
   /* ---------------------------------------------------------
-   *  复算：把玩家存下来的「种子 + 动作序列」重放一遍
+   *  存档的编码
+   *  ------------------------------------------------------------
+   *  动作一行：  t,x,tier     第 t 帧、投在 x、掉的是第 tier 级
+   *              t,i          第 t 帧用了一枚复活币
+   *  快照一行：  fN,sN,nN,rN,tN,gSIG
+   *              f 帧号 / s 分数 / n 球数 / r 复活币 / t 时间戳 / g 签名
+   *  全部用分号串成一行行文本：比 JSON 小一半以上，也顺手挡掉最低级的手改。
    * ------------------------------------------------------- */
 
-  /* 快照压成一行文本存进数据库，省体积、也有点防手改的意思：
-       f=帧  s=分数  n=球数  r=复活币  h=状态指纹 */
-  function snapshotLine(sn) {
-    return 'f' + sn.f + ',s' + sn.s + ',n' + sn.n + ',r' + sn.r + ',h' + sn.h.toString(36);
-  }
-
-  function parseSnapshotLine(line) {
-    var out = {};
-    String(line || '').split(',').forEach(function (kv) {
-      var k = kv.charAt(0);
-      var v = kv.slice(1);
-      if (k === 'h') out.h = parseInt(v, 36) >>> 0;
-      else if (k) out[k] = Number(v);
-    });
-    if (out.f === undefined || out.s === undefined || out.h === undefined) return null;
-    return { f: out.f | 0, s: out.s | 0, n: out.n | 0, r: out.r | 0, h: out.h >>> 0 };
-  }
-
-  /* 动作压成一行：t,x 投放；t,i 复活 */
   function actionLine(a) {
-    return a.k === 'revive' ? (a.t + ',i') : (a.t + ',' + a.x);
+    return a.k === 'revive' ? (a.t + ',i') : (a.t + ',' + a.x + ',' + (a.tier === undefined ? '' : a.tier));
   }
 
   function parseActionLine(line) {
@@ -829,223 +864,41 @@
     var x = Number(p[1]);
     if (!isFinite(x)) return null;
     var a = { k: 'drop', t: t | 0, x: x };
-    if (p.length > 2 && isFinite(Number(p[2]))) a.tier = Number(p[2]) | 0;
+    var tier = Number(p[2]);
+    if (p.length > 2 && isFinite(tier)) a.tier = tier | 0;
     return a;
   }
 
-  /* 分段复算（可暂停版）。
-     举报是在玩家浏览器里当场跑的：一整局要算几百万次浮点运算，
-     一口气跑会卡住页面（连「复算中…」都刷不出来）。
-     这里把复算写成一个生成器：每算一段就 yield 一次把主线程交还出去，
-     下次 next() 从原处接着算 —— 状态不重来，所以总耗时和同步版几乎一样。
+  function snapshotLine(sn) {
+    return 'f' + sn.f + ',s' + sn.s + ',n' + sn.n + ',r' + sn.r + ',d' + (sn.d || 0) +
+           ',t' + (sn.t || 0) + ',g' + (sn.g || '');
+  }
 
-     用法：
-       var it = verifySteps(rec, opts);          // 或 Core.verifyRunAsync(...)
-       var r = it.next(); while (!r.done) r = it.next(); */
-  function* verifySteps(rec, opts) {
-    opts = opts || {};
-    var scoreTol = opts.scoreTolerance === undefined ? 0 : opts.scoreTolerance;
-    var every = opts.yieldEvery || 90;          // 每多少帧交还一次主线程
-
-    function bad(reason) {
-      return { ok: false, verdict: 'malformed', reason: reason, replayScore: 0, claimed: 0, delta: 0, frameErrors: [] };
-    }
-
-    if (!rec || rec.seed === undefined || rec.seed === null) return bad('缺少随机种子');
-
-    var seed = strToSeed(rec.seed);
-    var actions = (rec.actions || []).slice().sort(function (a, b) { return a.t - b.t; });
-    var snaps = (rec.snapshots || []).slice().sort(function (a, b) { return a.f - b.f; });
-    var claimed = Number(rec.score) || 0;
-
-    var g = createGame(seed);
-    g.reset(seed);
-
-    /* 动作合法性预检：时间轴不能倒流、不能超速投放 */
-    var lastDrop = -1e9;
-    var minGapFrames = Math.floor((DROP_MS / 1000) / FIXED) - 1;   // 容 1 帧抖动
-    var frameErrors = [];
-    for (var i = 0; i < actions.length; i++) {
-      var a = actions[i];
-      if (a.t < 0 || a.t > MAX_FRAMES) return bad('动作时间越界');
-      if (a.k === 'drop') {
-        if (a.t - lastDrop < minGapFrames) {
-          return bad('投放间隔小于冷却（' + (a.t - lastDrop) + ' 帧 < ' + minGapFrames + '）');
-        }
-        lastDrop = a.t;
-      }
-    }
-
-    var maxFrame = snaps.length ? snaps[snaps.length - 1].f : 0;
-    for (var j = 0; j < actions.length; j++) maxFrame = Math.max(maxFrame, actions[j].t);
-    maxFrame += 2;
-
-    /* ---------- 快照对齐 ----------
-       关于「第 F 帧的快照记的是推进前还是推进后」：两条路都有——
-       常规快照是 update() 里物理推进之后封的；判负那条是 checkGameOver() 里封的，
-       而那一帧的帧号可能停在推进之前（定格/结束分支会提前 return，不再推进物理）。
-       为了不因这一点相位差把真实成绩误判成篡改，同一帧的两种状态都比一次，
-       命中任意一个就算对得上。想伪造仍然要同时骗过相邻两帧的完整状态指纹。 */
-    var pending = [];        // 当前帧待判的快照
-    var si = 0;              // 下一条要取出的快照
-    var ai = 0;              // 下一条要执行的动作
-
-    function trySnap(sn) {
-      if (sn.s !== g.state.score) {
-        frameErrors.push({ f: sn.f, kind: 'score', claimed: sn.s, actual: g.state.score });
-        return true;
-      }
-      if (sn.h === hashBalls(g.state.balls)) return true;
-      return false;
-    }
-
-    function collect(frameNow) {
-      while (si < snaps.length && snaps[si].f === frameNow) pending.push(snaps[si++]);
-    }
-
-    function judge(frameNow) {
-      var rest = [];
-      for (var k = 0; k < pending.length; k++) {
-        var sn = pending[k];
-        if (trySnap(sn)) continue;      // 命中（或分数直接错了）
-        rest.push(sn);                  // 这一相位没命中，留到下一相位再试
-      }
-      pending = rest;
-      /* 已经越过这一帧还没命中的，判定为过程数据对不上 */
-      while (pending.length && pending[0].f < frameNow) {
-        var miss = pending.shift();
-        frameErrors.push({ f: miss.f, kind: 'hash', claimed: miss.h, actual: hashBalls(g.state.balls) });
-      }
-    }
-
-    function applyActions(frameNow) {
-      while (ai < actions.length && actions[ai].t === frameNow) {
-        var act = actions[ai];
-        if (act.k === 'drop') {
-          if (!g.state.ready) {
-            frameErrors.push({ f: frameNow, kind: 'cooldown', claimed: 0, actual: 0 });
-          }
-          g.drop(act.x);
-        } else if (act.k === 'revive') {
-          g.revive();
-        }
-        ai++;
-      }
-    }
-
-    var guard = 0;
-    var sinceYield = 0;
-
-    while (guard++ < maxFrame + 600) {
-      var f = g.getFrame();
-      collect(f);            // ① 推进前
-      judge(f);
-      applyActions(f);
-
-      if (si >= snaps.length && ai >= actions.length) {
-        /* 都放完了：再推进一步，把最后一帧"推进后"的状态也判掉 */
-        g.update(FIXED);
-        judge(g.getFrame());
-        break;
-      }
-
-      g.update(FIXED);
-      judge(g.getFrame());   // ② 推进后
-
-      if (++sinceYield >= every) {
-        sinceYield = 0;
-        yield f;             // 交还主线程，下次从这里接着算
-      }
-    }
-
-    /* 收尾：万一还有没判完的快照（比如数据被截断），直接用当前状态收口 */
-    if (pending.length) {
-      for (var p = 0; p < pending.length; p++) {
-        frameErrors.push({ f: pending[p].f, kind: 'hash', claimed: pending[p].h, actual: hashBalls(g.state.balls) });
-      }
-      pending = [];
-    }
-
-    var replayScore = g.state.score;
-    var delta = replayScore - claimed;
-    var ok = Math.abs(delta) <= scoreTol;
-
-    var verdict = 'pass';
-    var reason = '';
-    if (!ok) {
-      verdict = 'fraud';
-      reason = '复算得分 ' + replayScore + '，与申报的 ' + claimed + ' 不符';
-    } else if (frameErrors.length) {
-      verdict = 'tamper';
-      reason = '得分对得上，但有 ' + frameErrors.length + ' 处过程快照对不上（疑似伪造过程数据）';
-    }
-
+  function parseSnapshotLine(line) {
+    var out = {};
+    String(line || '').split(',').forEach(function (kv) {
+      var k = kv.charAt(0);
+      if (k) out[k] = kv.slice(1);
+    });
+    if (out.f === undefined || out.s === undefined) return null;
     return {
-      ok: ok && frameErrors.length === 0,
-      verdict: verdict,
-      reason: reason,
-      replayScore: replayScore,
-      claimed: claimed,
-      delta: delta,
-      frames: g.getFrame(),
-      frameErrors: frameErrors.slice(0, 8),
-      frameErrorCount: frameErrors.length
+      f: Number(out.f) | 0,
+      s: Number(out.s) | 0,
+      n: Number(out.n) || 0,
+      r: Number(out.r) || 0,
+      d: Number(out.d) || 0,
+      t: Number(out.t) || 0,
+      g: out.g === undefined ? '' : String(out.g)
     };
   }
-
-  /* 复算一局（同步版；内部就是上面那个生成器一口气跑完，用于 Node 与 GitHub Action） */
-  function verifyRun(rec, opts) {
-    var it = verifySteps(rec, opts || {});
-    var r = it.next();
-    while (!r.done) r = it.next();
-    return r.value;
-  }
-
-  /* 异步版：每算一段就让出主线程，界面照样能刷进度
-     可选 opts.onProgress(frame)/opts.timeSlice/opts.yieldEvery */
-  function verifyRunAsync(rec, opts) {
-    opts = opts || {};
-    return new Promise(function (resolve, reject) {
-      var slice = opts.timeSlice || 12;
-      var it;
-      try {
-        it = verifySteps(rec, opts);
-      } catch (e) { reject(e); return; }
-
-      (function step() {
-        var deadline = Date.now() + slice;
-        try {
-          for (;;) {
-            var r = it.next();
-            if (r.done) { resolve(r.value); return; }
-            if (opts.onProgress) {
-              try { opts.onProgress(r.value); } catch (e) { /* 进度回调出错不影响复算 */ }
-            }
-            if (Date.now() >= deadline) { setTimeout(step, 0); return; }
-          }
-        } catch (e) { reject(e); }
-      })();
-    });
-  }
-
-  /* ---------------------------------------------------------
-   *  数据库里的紧凑编码
-   *  ------------------------------------------------------------
-   *  动作序列和快照都要进 GitHub（每人一个文件、前 100 名才有），
-   *  体积必须压住：用分号串起来的一行行文本，比 JSON 数组小一半以上，
-   *  顺手还能挡掉「手改 JSON 里的分数」这种最低级的作弊。
-   *
-   *  动作一行：  t,x[,tier]   投放（第几帧、投在哪）
-   *              t,i          复活（第几帧）
-   *  快照一行：  fN,sN,nN,rN,hN
-   * ------------------------------------------------------- */
 
   function encodeRun(rec) {
     return {
       seed: rec.seed,
       score: rec.score,
       a: (rec.actions || []).map(actionLine).join(';'),
-      k: (rec.snapshots || []).map(snapshotLine).join(';')
+      k: (rec.snapshots || []).map(snapshotLine).join(';'),
+      p: rec.spawn || ''
     };
   }
 
@@ -1054,94 +907,265 @@
     return {
       seed: o.seed,
       score: Number(o.score) || 0,
+      spawn: String(o.p || ''),
       actions: String(o.a || '').split(';').filter(Boolean).map(parseActionLine).filter(Boolean),
       snapshots: String(o.k || '').split(';').filter(Boolean).map(parseSnapshotLine).filter(Boolean)
     };
   }
 
   /* ---------------------------------------------------------
-   *  一键校验：结构 + 过程 + 复算
+   *  校验：只看结构 + 快照 + 掉落流水，不做校验
    *  ------------------------------------------------------------
-   *  提交、举报、以及别人打开举报面板时都走这一个入口，规则只有一份。
-   *  返回 { verdict, ok, ... }：
-   *    pass      复算得分与申报一致，且每一条过程快照都对得上
-   *    fraud     复算得分对不上（少报/多报）
-   *    tamper    得分对得上，但过程快照对不上（伪造过程数据）
-   *    malformed 数据本身不合法（缺种子、动作太密、超长……）
+   *  「分数有理」是怎么判的：
+   *    1. 最后一次快照的分数 == 榜上申报的分数（分数不能凭空多出来）；
+   *    2. 快照分数单调不减，而且每一条都是 500 的整倍数
+   *       （每 500 分存一次，缺一段就是数据不完整）；
+   *    3. 涨 500 分至少要有 3 次投放垫着 —— 一颗水果最多 55 分，
+   *       两次投放绝不可能涨 500，所以这条能挡住"白送分数"；
+   *    4. 帧号、时间戳、球数、复活币数全都单调/合理；
+   *    5. 每次投放掉的是哪一级，必须和种子生成的掉落流水完全一致
+   *       —— 这条和物理无关，却能把瞎编的动作序列挡在门外。
+   *
+   *  返回 { ok, verdict, reason, problems: [...] }；
+   *  verdict: 'pass' | 'incomplete'（快照不全）| 'implausible'（分数没道理）| 'malformed'
    * ------------------------------------------------------- */
 
-  var MIN_DROP_GAP_MS = DROP_MS - 40;      // 容一点网络/帧率抖动
-  var MAX_FRAMES = 60 * 60 * 60;           // 1 小时（60fps）—— 再长就不是人玩的了
+  var SNAP_STEP = 500;          // 每 500 分存一次快照
+  /* 一次投放最多能变出多少分：果子落下后连续合成，实测上界约 200 分，
+     这里取 210 留点余量 —— 只用来挡住"投两次报一千分"这种明显不合理的。 */
+  var MAX_SCORE_PER_DROP = 210;
+  var MAX_GAP_MS = 24 * 60 * 60 * 1000;   // 相邻快照最长间隔（够宽松，只挡明显不合理的）
 
-  function inspectRun(rec) {
+  /* 由种子直接推出来的「第 i 次投放掉哪一级」，不碰物理 */
+  /* 和引擎开局的取数顺序完全一致的独立实现：
+       reset() 里先 pickSpawnTier() 得到 pending，再 pickSpawnTier(pending) 得到 next，
+       之后每次投放消耗 "pending 变成 next、next 再抽一个"。
+       两边必须一模一样，否则流水会错位、把好人误判成作弊。 */
+  function spawnLedger(seed, count) {
+    var rng = mulberry32(seed >>> 0);
+    function roll() {
+      var r = rng(), acc = 0;
+      for (var i = 0; i < SPAWN_TIERS.length; i++) {
+        acc += SPAWN_WEIGHTS[i];
+        if (r <= acc) return SPAWN_TIERS[i];
+      }
+      return SPAWN_TIERS[0];
+    }
+    function pick(avoid) {
+      if (!AVOID_REPEAT || avoid === undefined) return roll();
+      for (var i = 0; i < 6; i++) {
+        var t = roll();
+        if (t !== avoid) return t;
+      }
+      return roll();
+    }
+    var out = [];
+    var pending = pick();
+    var next = pick(pending);
+    for (var k = 0; k < count; k++) {
+      out.push(pending);
+      pending = next;
+      next = pick(pending);
+    }
+    return out;
+  }
+
+  /* 一局分数的上界：把每次掉落的水果按"最理想的合成链"全合掉，能拿到多少分。
+     这是"白送分"最硬的挡板：申报分数一旦超过这个上界，就一定是编的。 */
+  function mergePotential(seed, drops) {
+    var ledger = spawnLedger(seed, drops);
+    var counts = [0, 0, 0, 0, 0, 0];
+    var i, k, total = 0;
+    for (i = 0; i < ledger.length; i++) {
+      var t = ledger[i];
+      if (t > 4) t = 4;
+      counts[t]++;
+      /* 从这一级往上，找到第一个还空着的等级，放进去；沿途腾空的都算合掉 */
+      for (k = t; k <= 4; k++) {
+        if (counts[k] > 0) { counts[k]--; total += MERGE_SCORE[k + 1]; }
+        else { counts[k]++; break; }
+      }
+    }
+    return total;
+  }
+
+  function auditRun(rec) {
+    var problems = [];
+
+    /* ---- 结构 ---- */
     if (!rec || typeof rec !== 'object') {
-      return { verdict: 'malformed', ok: false, reason: '没有对局数据' };
+      return { ok: false, verdict: 'malformed', reason: '没有对局数据', problems: ['no data'] };
     }
     if (rec.seed === undefined || rec.seed === null || rec.seed === '') {
-      return { verdict: 'malformed', ok: false, reason: '没有随机种子' };
+      return { ok: false, verdict: 'malformed', reason: '没有随机种子', problems: ['no seed'] };
     }
-    var score = Number(rec.score);
-    if (!isFinite(score) || score < 0 || score > 1e7) {
-      return { verdict: 'malformed', ok: false, reason: '分数不合法' };
+    var claimed = Number(rec.score);
+    if (!isFinite(claimed) || claimed < 0 || claimed > 1e7) {
+      return { ok: false, verdict: 'malformed', reason: '分数不合法', problems: ['bad score'] };
     }
-    var acts = rec.actions || [];
-    var snaps = rec.snapshots || [];
-    if (acts.length > 6000) {
-      return { verdict: 'malformed', ok: false, reason: '动作数量异常（' + acts.length + '）' };
-    }
-    if (snaps.length > 3000) {
-      return { verdict: 'malformed', ok: false, reason: '快照数量异常（' + snaps.length + '）' };
-    }
-    var last = -1e9;
-    for (var i = 0; i < acts.length; i++) {
-      var a = acts[i];
+
+    var actions = (rec.actions || []).slice().sort(function (a, b) { return a.t - b.t; });
+    var snaps = (rec.snapshots || []).slice().sort(function (a, b) { return a.f - b.f; });
+
+    if (actions.length > 6000) return { ok: false, verdict: 'malformed', reason: '动作数量异常', problems: ['too many actions'] };
+    if (snaps.length > 3000) return { ok: false, verdict: 'malformed', reason: '快照数量异常', problems: ['too many snapshots'] };
+
+    var lastDrop = -1e9;
+    var drops = 0;
+    var minGapFrames = Math.floor((DROP_MS / 1000) / FIXED) - 1;
+    for (var i = 0; i < actions.length; i++) {
+      var a = actions[i];
       if (!a || !isFinite(a.t) || a.t < 0 || a.t > MAX_FRAMES) {
-        return { verdict: 'malformed', ok: false, reason: '动作帧号越界' };
+        return { ok: false, verdict: 'malformed', reason: '动作帧号越界', problems: ['bad action frame'] };
       }
       if (a.k === 'drop') {
         if (!isFinite(a.x) || a.x < WALL || a.x > W - WALL) {
-          return { verdict: 'malformed', ok: false, reason: '投放位置越界' };
+          return { ok: false, verdict: 'malformed', reason: '投放位置越界', problems: ['bad action x'] };
         }
-        if (a.t - last < Math.floor(MIN_DROP_GAP_MS / 1000 / FIXED)) {
-          return { verdict: 'malformed', ok: false, reason: '投放间隔小于冷却' };
+        if (a.t - lastDrop < minGapFrames) {
+          return { ok: false, verdict: 'malformed', reason: '投放间隔小于冷却', problems: ['drops too close'] };
         }
-        last = a.t;
+        lastDrop = a.t;
+        drops++;
       }
     }
-    for (var j = 0; j < snaps.length; j++) {
-      var s = snaps[j];
-      if (!s || !isFinite(s.f) || s.f < 0 || s.f > MAX_FRAMES) {
-        return { verdict: 'malformed', ok: false, reason: '快照帧号越界' };
-      }
-      if (!isFinite(s.s) || s.s < 0) {
-        return { verdict: 'malformed', ok: false, reason: '快照分数不合法' };
-      }
-    }
-    /* 开局那一帧分数必须是 0：堵住「一上来就凭空有分」 */
-    if (snaps.length && snaps[0].f === 0 && snaps[0].s !== 0) {
-      return { verdict: 'tamper', ok: false, reason: '开局快照分数不为 0' };
-    }
-    return { verdict: 'pass', ok: true, reason: '' };
-  }
 
-  function validateRun(rec, opts) {
-    opts = opts || {};
-    var pre = inspectRun(rec);
-    if (!pre.ok) return pre;
+    if (!snaps.length) {
+      return { ok: false, verdict: 'incomplete', reason: '没有任何快照（数据不完整）', problems: ['no snapshot'] };
+    }
 
-    var res = verifyRun(rec, opts);
-    if (!res.ok && pre.ok) {
-      /* 复算判定优先：malformed 已经挡在前头了 */
+
+    /* ---- 快照本身 ---- */
+    var prev = null;
+    for (var s = 0; s < snaps.length; s++) {
+      var sn = snaps[s];
+      if (!isFinite(sn.f) || sn.f < 0 || sn.f > MAX_FRAMES) {
+        return { ok: false, verdict: 'malformed', reason: '快照帧号越界', problems: ['bad snap frame'] };
+      }
+      if (!isFinite(sn.s) || sn.s < 0) {
+        return { ok: false, verdict: 'malformed', reason: '快照分数不合法', problems: ['bad snap score'] };
+      }
+      /* 时间戳不能早于游戏存在的年代（挡住明显编造/清零的时间戳）。
+         注意：时间戳是 0 的旧数据不在此列，只查"有值但荒唐"的。 */
+      if (sn.t > 0 && sn.t < 1577836800000) problems.push('快照时间戳不合理 @' + sn.f);
+      if (prev) {
+        if (sn.f < prev.f) problems.push('快照帧号倒退 @' + sn.f);
+        if (sn.s < prev.s) problems.push('快照分数倒退 @s' + sn.s);
+        if (sn.t && prev.t && sn.t < prev.t) problems.push('快照时间戳倒退 @' + sn.f);
+        if (sn.t && prev.t && sn.t - prev.t > MAX_GAP_MS) problems.push('相邻快照间隔过久 @' + sn.f);
+      }
+      prev = sn;
+    }
+
+    /* 第一条必须是 0 分：堵住"一上来就有一坨分" */
+    if (snaps[0].s !== 0) {
+      return { ok: false, verdict: 'implausible', reason: '第一条快照不是 0 分', problems: ['start score != 0'] };
+    }
+
+    /* 中间每条必须是 500 的整倍数，而且从 0 开始一条不落地往上走。
+       注意不能只看"相邻两条差 500"：把中间某条删掉、剩下两条正好差 1000 时，
+       光看相邻差是查不出来的 —— 得按档位逐条点名。 */
+    var expected = 0;
+    for (var k = 1; k < snaps.length; k++) {
+      if (snaps[k].s % SNAP_STEP !== 0 && k < snaps.length - 1) {
+        problems.push('第 ' + (k + 1) + ' 条快照（s' + snaps[k].s + '）不是 ' + SNAP_STEP + ' 的整倍数');
+      }
+      if (snaps[k].s - snaps[k - 1].s !== SNAP_STEP && k < snaps.length - 1) {
+        problems.push('快照之间缺了一段（s' + snaps[k - 1].s + ' → s' + snaps[k].s + '）');
+      }
+    }
+    /* 该有的档位必须都在：0、500、1000、……、一直到"不超过最终分数的最大整倍数"。
+       例：最终 928 分 → 必须有 0 和 500 两条；最终正好 1000 分 → 必须有 0/500/1000。 */
+    var topBucket = claimed > 0 ? Math.floor((claimed - 1) / SNAP_STEP) * SNAP_STEP : 0;
+    var have = {};
+    for (var q2 = 0; q2 < snaps.length; q2++) have[snaps[q2].s] = true;
+    for (var b = 0; b <= topBucket; b += SNAP_STEP) {
+      if (!have[b]) problems.push('缺少 ' + b + ' 分那条快照');
+    }
+
+    /* 最后一条就是收尾那条：它必须正好等于申报分数 */
+    var lastSnap = snaps[snaps.length - 1];
+    if (lastSnap.s !== claimed) {
       return {
-        verdict: res.verdict, ok: false, reason: res.reason,
-        replayScore: res.replayScore, claimed: res.claimed, delta: res.delta,
-        frameErrors: res.frameErrors, frameErrorCount: res.frameErrorCount
+        ok: false, verdict: 'implausible',
+        reason: '最后一条快照是 ' + lastSnap.s + ' 分，申报的却是 ' + claimed + ' 分',
+        problems: ['final snapshot != claimed']
       };
     }
+    /* 收尾那条不能比前一条整倍数还低 */
+    if (snaps.length >= 2 && lastSnap.s < snaps[snaps.length - 2].s) {
+      problems.push('收尾快照比前一条还低');
+    }
+
+    /* ---- 分数有理（一）：投放次数要和分数对得上（累计口径）----
+       注意不能按"每一段涨了多少就要求这一段投了几次"来判：
+       水果落下来之后还会继续合成，收尾那几分完全可能是早先投下去的果子自己合的。
+       正确的说法是累计的：要拿到 S 分，总共至少得投过 ceil(S / 每次投放的分数上限) 次。
+       再要求投放次数单调不减（这是必须成立的）。 */
+    for (var q = 1; q < snaps.length; q++) {
+      if ((snaps[q].d || 0) < (snaps[q - 1].d || 0)) {
+        problems.push('快照里的投放次数倒退（d' + snaps[q - 1].d + ' → d' + snaps[q].d + '）');
+      }
+    }
+    for (var q3 = 0; q3 < snaps.length; q3++) {
+      var needTotal = Math.ceil(snaps[q3].s / MAX_SCORE_PER_DROP);
+      if ((snaps[q3].d || 0) < needTotal) {
+        problems.push('s' + snaps[q3].s + ' 分时只投放了 ' + (snaps[q3].d || 0) +
+                      ' 次（这个分数至少需要 ' + needTotal + ' 次）');
+      }
+    }
+    /* 快照里的投放次数不能超过动作序列里的总投放次数 */
+    if (snaps[snaps.length - 1].d > drops) {
+      problems.push('快照说我投了 ' + snaps[snaps.length - 1].d + ' 次，动作序列里只有 ' + drops + ' 次');
+    }
+    /* ---- 分数有理（二）：分数不能超过"这些水果最多能合出多少分" ---- */
+    if (drops > 0 && drops <= 6000) {
+      var cap = mergePotential(strToSeed(rec.seed), drops);
+      if (claimed > cap) {
+        return {
+          ok: false, verdict: 'implausible',
+          reason: '申报 ' + claimed + ' 分，但 ' + drops + ' 次投放最多只能合出 ' + cap + ' 分',
+          problems: ['score above merge potential (' + claimed + ' > ' + cap + ')']
+        };
+      }
+    }
+
+    /* 每条快照的签名：手改过分数/时间戳就会对不上（只报提示，不当硬门槛） */
+    var badSig = 0;
+    for (var sg = 0; sg < snaps.length; sg++) {
+      var one = snaps[sg];
+      if (one.g && one.g !== snapSig(strToSeed(rec.seed), one)) badSig++;
+    }
+    if (badSig) problems.push('有 ' + badSig + ' 条快照的签名对不上（疑似被手改）');
+
+    /* ---- 掉落流水：每次投放的等级必须和种子推出来的一致 ---- */
+    if (drops > 0) {
+      var ledger = rec.spawn && rec.spawn.length >= drops
+        ? rec.spawn.split('').map(function (c) { return parseInt(c, 36); })
+        : spawnLedger(strToSeed(rec.seed), drops);
+      var idx = 0;
+      var mismatches = 0;
+      for (var m = 0; m < actions.length; m++) {
+        if (actions[m].k !== 'drop') continue;
+        if (actions[m].tier === undefined) continue;      // 老数据没有等级字段，跳过这条检查
+        if (actions[m].tier !== ledger[idx]) mismatches++;
+        idx++;
+      }
+      if (mismatches > 0) {
+        return {
+          ok: false, verdict: 'implausible',
+          reason: '有 ' + mismatches + " 次投放的水果等级和这个种子对不上",
+          problems: ['spawn ledger mismatch x' + mismatches]
+        };
+      }
+    }
+
+    if (problems.length) {
+      return { ok: false, verdict: 'incomplete', reason: problems[0], problems: problems };
+    }
     return {
-      verdict: 'pass', ok: true, reason: '',
-      replayScore: res.replayScore, claimed: res.claimed, delta: res.delta,
-      frameErrorCount: res.frameErrorCount
+      ok: true, verdict: 'pass', reason: '', problems: [],
+      stats: { drops: drops, snapshots: snaps.length, claimed: claimed, lastFrame: lastSnap.f }
     };
   }
 
@@ -1149,18 +1173,13 @@
    *  对外
    * ------------------------------------------------------- */
 
-  function hashBallsQ(balls) { return hashBalls(balls); }
-
   return {
     createGame: createGame,
-    verifyRun: verifyRun,
-    verifyRunAsync: verifyRunAsync,
-    inspectRun: inspectRun,
-    validateRun: validateRun,
+    auditRun: auditRun,              // 只校验快照与掉落流水，不做校验
+    spawnLedger: spawnLedger,
     setShapes: setShapes,
     shapeOf: shapeOf,
     makeBall: makeBall,
-    hashBalls: hashBallsQ,
     snapshotLine: snapshotLine,
     parseSnapshotLine: parseSnapshotLine,
     actionLine: actionLine,
@@ -1173,7 +1192,7 @@
     mulberry32: mulberry32,
     CONST: {
       W: W, H: H, WALL: WALL, DROP_Y: DROP_Y, DANGER_Y: DANGER_Y,
-      DROP_MS: DROP_MS, FIXED: FIXED, SNAPSHOT_EVERY: SNAPSHOT_EVERY,
+      DROP_MS: DROP_MS, FIXED: FIXED, SNAP_STEP: SNAP_STEP,
       MAX_TIER: MAX_TIER, MAX_BONUS: MAX_BONUS, REVIVE_STEP: REVIVE_STEP,
       FRUITS: FRUITS, MERGE_SCORE: MERGE_SCORE
     }
