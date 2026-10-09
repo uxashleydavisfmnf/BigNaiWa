@@ -532,6 +532,12 @@ console.log('前端集成自检\n');
   eq(rows.length, 2, '两条都渲染出来了（坏数据不影响别人）');
   ok(/没有存档的人/.test(rows[0].textContent), '缺存档的人照样显示名字与分数', rows[0].textContent);
   ok(rows[0].children.some((c) => c.className.indexOf('report-btn') >= 0), '他也有举报按钮');
+  {
+    const rb = rows[0].children.filter((c) => c.className.indexOf('report-btn') >= 0)[0];
+    eq(rb.title, '举报玩家作弊', '悬浮提示只说「举报玩家作弊」，不解释怎么查');
+    ok(rb.title.indexOf('快照') < 0 && rb.title.indexOf('本地') < 0 && rb.title.indexOf('检查') < 0,
+      '提示里不出现任何检查机制的字眼', rb.title);
+  }
 
   /* 举报一个"没有记录"的人 → 不能误报成作弊 */
   const reportBtn = rows[0].children.filter((c) => c.className.indexOf('report-btn') >= 0)[0];
