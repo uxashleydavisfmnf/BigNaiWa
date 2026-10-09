@@ -591,7 +591,7 @@ console.log('前端集成自检\n');
   ok(honestDone, '核查跑完了', honestBtn.textContent);
   eq(honestBtn.textContent, '快照完整', '老实人只显示「快照完整」');
   eq(writes().filter((w) => w.url.indexOf('data/reports') >= 0).length, beforeHonest, '没有误报');
-  ok(/快照完整|没有发现问题/.test(honestBtn.title), '提示说明了快照完整', honestBtn.title);
+  eq(honestBtn.title, '未发现问题', '提示只说结论，不解释检查机制');
   /* 举报的闸门：本机没法通过就不上传 —— 这里再确认一次"上报数没变" */
   eq(writes().filter((w) => w.url.indexOf('data/reports') >= 0).length, beforeHonest,
     '本机判定「快照完整」→ 举报一个字节都没上传');

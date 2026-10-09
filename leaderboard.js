@@ -297,8 +297,7 @@
       btn.type = 'button';
       btn.className = 'report-btn';
       btn.textContent = '举报';
-      btn.title = '在本机检查他的快照是否完整（每 500 分一条）、分数有没有道理；' +
-                  '本机查出问题才会上传举报，查不出问题就什么都不发';
+      btn.title = '举报玩家作弊';
       btn.addEventListener('click', () => reportEntry(entry, btn));
       line.appendChild(btn);
     }
@@ -654,7 +653,7 @@
       if (!res || !res.data || !res.data.run) {
         /* 数据库里没有这局的快照 —— 这本身就是「快照不完善」，点举报就提交 */
         stop('已举报 ✓');
-        btn.title = '已提交举报：数据库里没有这局的快照与动作序列（无记录）';
+        btn.title = '已收到举报，谢谢';
         return writeReport(entry, Number(entry.score) || 0, {
           verdict: 'incomplete',
           reason: '数据库里没有这局的快照与动作序列（无记录）',
@@ -677,12 +676,12 @@
 
       if (audit.ok) {
         stop('快照完整');
-        btn.title = '快照完整：' + (rec.snapshots || []).length + ' 条快照（每 500 分一条）、分数对得上，没有发现问题';
+        btn.title = '未发现问题';
         return false;
       }
 
       stop('已举报 ✓');
-      btn.title = '已提交举报：' + (audit.reason || audit.verdict);
+      btn.title = '已收到举报，谢谢';
       return writeReport(entry, claimed, audit).then((done) => {
         if (done) {
           const row = btn.parentNode;
