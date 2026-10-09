@@ -24,11 +24,30 @@
   'use strict';
 
   var TOP_N = 100;                 // 总榜记录前 100
-  var NAME_MAX = 12;
+  var NAME_MAX = 12;               // 按「字」算，不是按 UTF-16 码元 —— 一个表情算一个字
 
+  /* 收拾昵称。三件事：
+       1. 去掉控制字符和零宽字符 —— \u200b 这类看不见的东西会让排版看着"飘"；
+       2. 去掉**孤立代理项**（半个表情）。它显示出来就是 �，
+          而且一旦被写进数据库就永久坏掉 —— 排行榜中文/表情"不稳定"就是这么来的；
+       3. 按**码点**截断到 NAME_MAX 个字，绝不把表情劈成两半。
+     normalizeBoard 读数据时也走这里，所以库里的历史脏名字在显示时会被顺手修好。 */
   function cleanName(raw) {
-    var n = String(raw == null ? '' : raw).replace(/[\u0000-\u001f\u007f]/g, '').trim();
-    if (n.length > NAME_MAX) n = n.slice(0, NAME_MAX);
+    var n = String(raw == null ? '' : raw)
+      .replace(/[\u0000-\u001f\u007f\u200b-\u200f\u2028\u2029\ufeff]/g, '')
+      .trim();
+    /* Array.from 按码点切：合法的表情是一个长度 2 的元素，
+       孤立的半个表情是长度 1、码元落在 D800~DFFF 的元素 —— 这种直接丢掉。 */
+    var chars = [];
+    var arr = Array.from(n);
+    for (var i = 0; i < arr.length; i++) {
+      var ch = arr[i];
+      var code = ch.charCodeAt(0);
+      if (ch.length === 1 && code >= 0xD800 && code <= 0xDFFF) continue;
+      chars.push(ch);
+    }
+    if (chars.length > NAME_MAX) chars = chars.slice(0, NAME_MAX);
+    n = chars.join('').trim();
     return n || '匿名玩家';
   }
 
@@ -278,6 +297,7 @@
     NO_RECORD: NO_RECORD,
     qualifiesStandalone: qualifiesStandalone,
     cleanName: cleanName,
+    NAME_MAX: NAME_MAX,
     hashIdentity: hashIdentity,
     cmpEntry: cmpEntry,
     newBoard: newBoard,

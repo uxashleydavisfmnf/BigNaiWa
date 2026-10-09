@@ -194,5 +194,35 @@ eq(Board.formatScore(1234.6), '1235', '分数取整显示');
 eq(Board.rankLabel(0) + Board.rankLabel(1) + Board.rankLabel(2), '🥇🥈🥉', '前三名是奖牌');
 eq(Board.rankLabel(3), '4', '第四名是数字（索引 3 → 名次 4）');
 
+/* ---------- I. 昵称：中文 / 表情不能被劈坏 ---------- */
+console.log('\n[I] 昵称处理');
+{
+  const hasLone = (s) => /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(s);
+
+  /* 让表情正好骑在"第 12 个字"的切点上 —— 老实现会把表情劈成半个（显示成 �） */
+  let allClean = true;
+  for (let k = 2; k <= 14; k++) {
+    const raw = '奶'.repeat(k) + '🍉尾巴';
+    const out = Board.cleanName(raw);
+    if (hasLone(out)) { allClean = false; console.log('    劈坏了: ' + JSON.stringify(raw) + ' → ' + JSON.stringify(out)); }
+  }
+  ok(allClean, '各种切点下都不会把表情劈成半个代理项');
+
+  eq(Board.cleanName('奶' + '\u200b' + '娃'), '奶娃', '零宽字符会被清掉（排版才稳）');
+  eq(Board.cleanName('\u0000奶\u007f娃  '), '奶娃', '控制字符会清掉、首尾空白会 trim');
+  eq(Board.cleanName('奶'.repeat(11) + '\ud83c'), '奶'.repeat(11), '已经坏掉的半个表情会被丢掉');
+  eq(Array.from(Board.cleanName('🍉'.repeat(30))).length, Board.NAME_MAX, '按「字」截断：一串表情也只留 12 个');
+  eq(Board.cleanName('🍉'), '🍉', '单个表情是合法的，要留下');
+  eq(Board.cleanName('一二三四五六七八九十十一十二十三'), '一二三四五六七八九十十一', '中文按字截断到 12 个字');
+  eq(Board.cleanName('   '), '匿名玩家', '纯空白 → 匿名玩家');
+
+  /* 读库的时候也要顺手修好历史脏数据 */
+  const dirty = Board.normalizeBoard({
+    entries: [{ id: 'x', score: 100, name: '奶'.repeat(11) + '\ud83c', submittedAt: 1 }]
+  });
+  ok(!hasLone(dirty.entries[0].name), '从库里读出来的坏名字也会被修好',
+    JSON.stringify(dirty.entries[0].name));
+}
+
 console.log('\n' + pass + ' 通过 / ' + fail + ' 失败');
 process.exit(fail ? 1 : 0);

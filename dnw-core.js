@@ -682,25 +682,7 @@
        （500 / 1000 / 1500……），开局先封一条 0 分；
        收尾（判负）再封一条，分数就是这一局最终拿到的分数。
        每条带上：帧号、分数、球数、复活币、已投放次数、时间戳、签名。 */
-    function sealSnapshot(force) {
-      var isStart = snapshots.length === 0;
-      var isEnd = !!force;
-
-      if (isStart) { pushSnap(0); return; }
-
-      if (isEnd) {
-        /* 收尾：最终分数可能刚好等于上一条（比如正好卡在 500），那就别重复 */
-        if (snapshots[snapshots.length - 1].s !== state.score) pushSnap(state.score);
-        return;
-      }
-
-      if (state.score < SNAP_STEP) return;
-      var bucket = Math.floor(state.score / SNAP_STEP) * SNAP_STEP;
-      if (bucket < nextSnapScore) return;          // 还没跨到下一个整倍数
-      if (snapshots[snapshots.length - 1].s === bucket) return;  // 这条已经有了
-      pushSnap(bucket);
-    }
-
+    /* 封一条快照（只负责写数据，不碰档位游标） */
     function pushSnap(score) {
       var sn = {
         f: frame,
@@ -714,7 +696,33 @@
       sn.g = snapSig(sn);
       snapshots.push(sn);
       state.lastSnapshot = sn;
-      nextSnapScore = (Math.floor(score / SNAP_STEP) + 1) * SNAP_STEP;
+    }
+
+    /* 把「已经跨过、但还没封」的 500 档位补齐。
+       为什么需要补齐：分数可能一帧里跨过好几档（连锁合成，或者两只神奶蛙 +500），
+       而判负那一刻会封一条**真实分数**的快照 —— 老实现顺手把档位游标推到了下一档，
+       于是被跨过的那几个档位永远缺一条，校验就会判成「数据不全」→ 好人被误删。
+       （用了复活币的局尤其容易踩到：一局里有好几条真实分数快照。） */
+    function sealBuckets() {
+      while (nextSnapScore <= state.score) {
+        pushSnap(nextSnapScore);          // 记的就是档位值：500 / 1000 / 1500 …
+        nextSnapScore += SNAP_STEP;
+      }
+    }
+
+    /* 对外就一个入口：
+         force=false —— 每帧调用，只补齐跨过的档位
+         force=true  —— 判负 / 导出时调用，补齐档位后再补一条"真实分数"收尾 */
+    function sealSnapshot(force) {
+      if (snapshots.length === 0) {       // 开局那条 0 分
+        pushSnap(0);
+        nextSnapScore = SNAP_STEP;
+        return;
+      }
+      sealBuckets();
+      if (force && snapshots[snapshots.length - 1].s !== state.score) {
+        pushSnap(state.score);
+      }
     }
 
     /* ---------- 主更新 ---------- */
@@ -793,11 +801,7 @@
          · 有些局不是"判负"结束的（自己收了 / 没到判负就结算了）；
          · 一局没到 500 分的话，上面一条都还没封过。
          不补的话最后一条快照不等于最终分数，初步校验就会说数据不完整。 */
-      if (!snapshots.length) {
-        pushSnap(state.score);
-      } else if (overFrame !== frame || snapshots[snapshots.length - 1].s !== state.score) {
-        sealSnapshot(true);
-      }
+      sealSnapshot(true);          // 补齐档位 + 补一条收尾
       return {
         seed: seedToStr(seed),
         score: state.score,
@@ -1090,21 +1094,28 @@
     /* 结构明显有问题就直接回（不用再往下算上界） */
     if (quick.verdict === 'malformed') return quick;
 
-    /* 每条中间快照都该是 500 的整倍数，且一条不落、不重复；
-       收尾那条是实际分数（可以不是整倍数）。 */
+    /* 档位核对。
+       ⚠️ 别以为"除了收尾那条，其它都该是 500 的整倍数"：
+       判负那一刻封的快照记的是**当时的真实分数**（比如 777），
+       用了复活币接着打的话，一局里会有好几条这种"真实分数"快照
+       （每次判负封一条，都不是整倍数）。
+       老实现要求"除最后一条外都必须是整倍数"，于是用了复活币的正常成绩
+       会被判成造假、进而被自动化流程误删 —— 这里按下面这套来：
+         · 只有 500 的整倍数才登记成"档位"（判负快照直接跳过）
+         · 真正要保证的是「每个 500 档位都有对应快照，一个不落」 */
     var seen = {};
     for (var k = 0; k < snaps.length; k++) {
       var sn = snaps[k];
       if (sn.t > 0 && sn.t < 1577836800000) problems.push('快照时间戳不合理（第 ' + (k + 1) + ' 条）');
-      if (k < snaps.length - 1) {
-        if (sn.s % SNAP_STEP !== 0) problems.push('第 ' + (k + 1) + ' 条快照（s' + sn.s + '）不是 ' + SNAP_STEP + ' 的整倍数');
+      if (sn.s % SNAP_STEP === 0) {
         if (seen[sn.s]) problems.push('档位重复（s' + sn.s + ' 出现两次）');
         seen[sn.s] = 1;
       }
       if (k > 0 && (sn.d || 0) < (snaps[k - 1].d || 0)) problems.push('快照里的投放次数倒退');
     }
+    /* 该有的档位一个都不能少（收尾那条如果正好是整倍数，也算它顶上了） */
     for (var b = 0; b < claimed; b += SNAP_STEP) {
-      if (!seen[b] && b !== snaps[snaps.length - 1].s) problems.push('缺少 ' + b + ' 分那条快照');
+      if (!seen[b]) problems.push('缺少 ' + b + ' 分那条快照');
     }
 
     /* 上界：用种子推出这么多步的水果，最多能合出多少分 */

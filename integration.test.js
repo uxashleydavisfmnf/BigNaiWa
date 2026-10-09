@@ -592,6 +592,43 @@ console.log('前端集成自检\n');
   eq(honestBtn.textContent, '快照完整', '老实人只显示「快照完整」');
   eq(writes().filter((w) => w.url.indexOf('data/reports') >= 0).length, beforeHonest, '没有误报');
   ok(/快照完整|没有发现问题/.test(honestBtn.title), '提示说明了快照完整', honestBtn.title);
+  /* 举报的闸门：本机没法通过就不上传 —— 这里再确认一次"上报数没变" */
+  eq(writes().filter((w) => w.url.indexOf('data/reports') >= 0).length, beforeHonest,
+    '本机判定「快照完整」→ 举报一个字节都没上传');
+
+  /* ---------- F2. 昵称里的中文/表情：从输入到上榜，一个字都不能坏 ---------- */
+  console.log('\n[F2] 昵称端到端');
+  {
+    const hasLone = (s) => /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(s);
+    /* 让表情骑在截断点上：这是老版本会显示成 � 的那种昵称 */
+    const tricky = '奶'.repeat(11) + '🍉尾巴';
+    els.nickInput.value = tricky;
+    els.nickInput.dispatchEvent({ type: 'change', target: els.nickInput });
+    eq(els.myNameLabel.textContent, Board.cleanName(tricky), '输入框提交后显示的就是清理过的名字');
+    ok(!hasLone(els.myNameLabel.textContent), '界面上没有半个代理项（不会出现 �）',
+      JSON.stringify(els.myNameLabel.textContent));
+
+    /* 打一局上榜，检查库里存的名字 */
+    putFile('data/board.json', JSON.stringify(Board.newBoard()));
+    repo.files.delete('data/owners/' + MY_ID + '.json');
+    await LB.refresh();
+    LB.onRunStart();
+    fakeNow += 20000;
+    playAndSettle(45, 103);
+    await until(() => /已同步 ✓|无记录|失败|没刷新纪录/.test(els.syncState.textContent), 400);
+
+    const stored = JSON.parse(repo.files.get('data/owners/' + MY_ID + '.json').text);
+    ok(!hasLone(stored.name), '存进库里的名字没有被劈坏', JSON.stringify(stored.name));
+    eq(Array.from(stored.name).length <= Board.NAME_MAX, true,
+      '存进库里的名字不超过 ' + Board.NAME_MAX + ' 个字', stored.name);
+
+    /* 再刷新一次榜，看看渲染出来的文本 */
+    await LB.refresh();
+    const rows = els.boardList.children;
+    const mine = rows.filter((c) => /（我）/.test(c.textContent))[0] || rows[0];
+    ok(!hasLone(mine.textContent), '榜上渲染出来的文本也没有坏字符', JSON.stringify(mine.textContent));
+    ok(mine.textContent.indexOf('�') < 0, '界面上不出现 U+FFFD 替换符');
+  }
 
   /* ---------- G. 拿不到公网 IP → 本地 ID 兜底 ---------- */
   console.log('\n[G] 拿不到公网 IP');

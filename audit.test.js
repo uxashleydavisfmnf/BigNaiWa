@@ -325,6 +325,62 @@ console.log('\n[E4] 稳健性（120 局）');
   ok(shortest >= 1, '短局也至少有 1 条快照', '最少 ' + shortest + ' 条 / 最多 ' + longest + ' 条');
 }
 
+/* ---------- E5. 复活币：判负快照不是 500 的整倍数，不能当成造假 ---------- */
+console.log('\n[E5] 用了复活币的成绩');
+{
+  /* 造一局"死过几次又救回来"的记录：
+       0 →(死)777 →500 档? 不，777 →1000 档 →(死)1200 →1500 档 →(收尾)1534
+     其中 777 / 1200 / 1534 都不是 500 的整倍数 —— 老实现会把 777、1200 判成
+     "不是整倍数" → 举报口径不通过 → 自动化流程把这个人删了。 */
+  function buildReviveRun(seed) {
+    const g = Core.createGame(seed);
+    g.reset(seed);
+    g.addScore(777);
+    g.gameOver();                       // 第一次判负 → 封一条 777 的快照
+    g.state.revives = 2;
+    g.revive();                         // 用复活币接着打
+    g.addScore(223);                    // 到 1000
+    g.update(FIXED);                    // 这一帧会封 1000 档
+    g.addScore(200);                    // 到 1200
+    g.gameOver();                       // 第二次判负 → 封一条 1200 的快照
+    g.revive();
+    g.addScore(300);                    // 到 1500
+    g.update(FIXED);                    // 封 1500 档
+    g.addScore(34);                     // 到 1534
+    return g.exportRun();
+  }
+
+  const run = buildReviveRun(20261009);
+  const scores = run.snapshots.map((x) => x.s);
+  ok(scores.indexOf(777) >= 0 && scores.indexOf(1200) >= 0,
+    '记录里确实有"判负快照"（不是 500 的整倍数）', scores.join('→'));
+  eq(scores[scores.length - 1], run.score, '收尾那条 = 最终分数');
+
+  const packedRev = Core.encodeRun(run);
+  const aq = Core.auditQuick(Core.decodeRun(packedRev));
+  const ar = Core.auditReport(Core.decodeRun(packedRev));
+  eq(aq.verdict, 'pass', '初步校验：通过');
+  eq(ar.verdict, 'pass', '举报口径：通过（不能因为复活币就判造假）');
+  ok(!(ar.problems || []).some((p) => /整倍数/.test(p)),
+    '没有任何"不是 500 的整倍数"的指控', (ar.problems || []).join('；'));
+
+  /* 连续两局死而复生也要没事 */
+  let bad = 0;
+  for (let i = 0; i < 20; i++) {
+    const r = buildReviveRun(1000 + i * 37);
+    const a = Core.auditReport(Core.decodeRun(Core.encodeRun(r)));
+    if (!a.ok) { bad++; console.log('    seed ' + (1000 + i * 37) + ' 被误判：' + a.reason); }
+  }
+  eq(bad, 0, '20 局复活成绩全部通过举报口径');
+
+  /* 但"少了 500 档"仍然必须抓出来（放宽不能把真检查也放掉） */
+  const missingBucket = Core.decodeRun(packedRev);
+  missingBucket.snapshots = missingBucket.snapshots.filter((x) => x.s !== 1000);
+  const aMiss = Core.auditReport(missingBucket);
+  ok(!aMiss.ok && /缺少 1000/.test((aMiss.problems || []).join(' ')),
+    '缺了 1000 档照样抓出来', (aMiss.problems || []).join('；'));
+}
+
 /* ---------- F. 结构非法 ---------- */
 console.log('\n[F] 结构非法');
 eq(Core.auditQuick(null).verdict, 'malformed', '空数据 → malformed');

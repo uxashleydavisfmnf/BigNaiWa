@@ -297,7 +297,8 @@
       btn.type = 'button';
       btn.className = 'report-btn';
       btn.textContent = '举报';
-      btn.title = '检查这位玩家的快照是否完整（每 500 分一条）、分数有没有道理，有问题就提交证据';
+      btn.title = '在本机检查他的快照是否完整（每 500 分一条）、分数有没有道理；' +
+                  '本机查出问题才会上传举报，查不出问题就什么都不发';
       btn.addEventListener('click', () => reportEntry(entry, btn));
       line.appendChild(btn);
     }
@@ -695,8 +696,14 @@
     });
   }
 
-  /* 把举报证据写进库里（不直接改别人的成绩，抹除交给自动化复核） */
+  /* 把举报证据写进库里（不直接改别人的成绩，抹除交给自动化复核）。
+     ⚠️ 只在本机核查**确实发现问题**时才调用：
+        本机算出来是「通过」（快照完整/分数合理）就一个字节都不写。
+        这个判断放在这里当唯一出口，任何调用方都绕不过去。 */
   function writeReport(entry, claimed, audit) {
+    if (!audit || audit.ok === true || audit.verdict === 'pass') {
+      return Promise.resolve(false);
+    }
     const evidence = {
       v: 1,
       at: Date.now(),
