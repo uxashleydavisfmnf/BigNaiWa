@@ -1,18 +1,1 @@
-{
-  "v": 1,
-  "updatedAt": 1791559667699,
-  "total": 1,
-  "topN": 100,
-  "entries": [
-    {
-      "id": "0c680j0ieflrs",
-      "owner": "data/owners/0c680j0ieflrs.json",
-      "name": "刘醒",
-      "score": 4458,
-      "submittedAt": 1791558551984,
-      "runId": "mv13le23-5",
-      "run": null,
-      "flags": 0
-    }
-  ]
-}
+{"v":1,"updatedAt":1791560641140,"total":2,"topN":100,"entries":[{"id":"0c680j0ieflrs","owner":"data/owners/0c680j0ieflrs.json","name":"刘醒","score":4458,"submittedAt":1791558551984,"runId":"mv13le23-5","run":null,"flags":0},{"id":"9tfw2e17mvy2c","owner":"data/owners/9tfw2e17mvy2c.json","name":"zyc","score":1100,"submittedAt":1791560637956,"runId":"mv14qtdx-2","run":null,"flags":0}]}
