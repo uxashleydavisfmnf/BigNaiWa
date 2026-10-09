@@ -1,21 +1,6 @@
 {
   "v": 1,
-  "updatedAt": 1791558060672,
-  "note": "被抹除的成绩只在这里留一条指纹：谁、什么时候、报了多少分、复算出来多少、为什么删。对局数据（随机种子 / 动作序列 / 快照）已按规则一起删除。",
-  "records": [
-    {
-      "id": "0c680j0ieflrs",
-      "name": "刘醒",
-      "score": 3781,
-      "at": 1791558060672,
-      "reason": "第 9 条快照（s3751）不是 500 的整倍数",
-      "verdict": "incomplete",
-      "problems": [
-        "第 9 条快照（s3751）不是 500 的整倍数"
-      ],
-      "snapshots": 10,
-      "reports": 1,
-      "verifier": "github-actions/rebuild-board"
-    }
-  ]
+  "updatedAt": 1791559024630,
+  "note": "被抹除的成绩只在这里留一条指纹：谁、什么时候、报了多少分、为什么删。误判会被人工清掉。",
+  "records": []
 }
