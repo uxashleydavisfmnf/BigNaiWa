@@ -166,6 +166,54 @@ const board2 = JSON.parse(fs.readFileSync(path.join(tmp, 'data', 'board.json'), 
 ok(!board2.entries.some((e) => e.id === 'tamper0000001'), '改了分数的记录进不了总榜');
 ok(board2.entries.some((e) => e.id === 'honest0000001'), '没影响别人');
 
+console.log('\n[6] 用了复活币的成绩不能被误删');
+{
+  /* 造一局"死过又救回来"的对局：判负快照不是 500 的整倍数（777 / 1200）。
+     老版本会因为"第 N 条快照不是 500 的整倍数"把这条记录判成造假删掉 ——
+     这正是线上出现过的误判。 */
+  function reviveRun(seed) {
+    const g = Core.createGame(seed);
+    g.reset(seed);
+    g.addScore(777);
+    g.gameOver();
+    g.state.revives = 2;
+    g.revive();
+    g.addScore(223);
+    g.update(FIXED);
+    g.addScore(200);
+    g.gameOver();
+    g.revive();
+    g.addScore(300);
+    g.update(FIXED);
+    g.addScore(34);
+    return g.exportRun();
+  }
+
+  const run = reviveRun(20261009);
+  const scores = run.snapshots.map((x) => x.s);
+  ok(scores.indexOf(777) >= 0 && scores.indexOf(1200) >= 0,
+    '这局确实有"判负快照"（非 500 整倍数）', scores.join('→'));
+
+  /* 写成 owner 记录，跑一遍重建工具 */
+  fs.writeFileSync(path.join(tmp, 'data', 'owners', 'reviveplayer1.json'), JSON.stringify({
+    v: 1, id: 'reviveplayer1', key: 'ip', name: '用了复活币的人', score: run.score,
+    runId: 'rev-1', submittedAt: 1700000009000,
+    run: Core.encodeRun(run), verify: { verdict: 'pass' }
+  }, null, 2));
+
+  const out6 = runTool(tmp);
+  if (process.env.VERBOSE) console.log(out6);
+  ok(fs.existsSync(path.join(tmp, 'data', 'owners', 'reviveplayer1.json')),
+    '对局数据还在（没有被误删）');
+  const vd = JSON.parse(fs.readFileSync(path.join(tmp, 'data', 'voided.json'), 'utf8'));
+  ok(!vd.records.some((r) => r.id === 'reviveplayer1'),
+    '没有被记进黑名单', JSON.stringify(vd.records.map((r) => r.id)));
+  const bd = JSON.parse(fs.readFileSync(path.join(tmp, 'data', 'board.json'), 'utf8'));
+  const mine = bd.entries.filter((e) => e.id === 'reviveplayer1')[0];
+  ok(!!mine, '总榜里还有这个人');
+  eq(mine && mine.score, run.score, '分数原样保留');
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
 
 console.log('\n' + pass + ' 通过 / ' + fail + ' 失败');
