@@ -1,1 +1,7 @@
-{"v":1,"updatedAt":1791620505684,"total":3,"topN":100,"entries":[{"id":"0c680j0ieflrs","owner":"data/owners/0c680j0ieflrs.json","name":"刘醒","score":4458,"submittedAt":1791558551984,"runId":"mv13le23-5","run":null,"flags":0},{"id":"7z58ru1bxzvx5","owner":"data/owners/7z58ru1bxzvx5.json","name":"萤","score":1889,"submittedAt":1791620502103,"runId":"mv24f7pg-2","run":null,"flags":0},{"id":"9tfw2e17mvy2c","owner":"data/owners/9tfw2e17mvy2c.json","name":"zyc","score":1100,"submittedAt":1791560637956,"runId":"mv14qtdx-2","run":null,"flags":0}]}
+{
+  "v": 1,
+  "updatedAt": 1791621401237,
+  "total": 0,
+  "topN": 100,
+  "entries": []
+}
